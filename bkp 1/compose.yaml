@@ -1,0 +1,243 @@
+services:
+  db:
+    image: postgres:17-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-movies}
+      POSTGRES_USER: ${POSTGRES_USER:-movies}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-movies_local}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    ports:
+    - 5433:5432
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # Existing structured/fuzzy movie DB API.
+  app:
+    build: ./movie-db-app
+    restart: "on-failure:3"
+    depends_on:
+      db:
+        condition: service_healthy
+        restart: true
+    ports:
+      - "127.0.0.1:${APP_PORT:-8001}:8000"
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-movies}
+      POSTGRES_USER: ${POSTGRES_USER:-movies}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-movies_local}
+      DATA_DIR: /app/data
+      DATASET_URL: ${DATASET_URL:-https://www.kaggle.com/api/v1/datasets/download/tmdb/tmdb-movie-metadata}
+      KAGGLE_API_TOKEN: ${KAGGLE_API_TOKEN:-}
+      KAGGLE_USERNAME: ${KAGGLE_USERNAME:-}
+      KAGGLE_KEY: ${KAGGLE_KEY:-}
+      API_KEY: ${API_KEY:-}
+      FUZZY_THRESHOLD: ${FUZZY_THRESHOLD:-0.30}
+      FUZZY_MIN_GAP: ${FUZZY_MIN_GAP:-0.10}
+      QUERY_TIMEOUT_MS: ${QUERY_TIMEOUT_MS:-5000}
+    volumes:
+      - app_data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 180s
+
+  # ------------------------------
+  # Milvus standalone
+  # ------------------------------
+  # Logical service 1: vector database.
+  milvus-etcd:
+    image: gcr.io/etcd-development/etcd:v3.5.25
+    restart: unless-stopped
+
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+      ETCD_SNAPSHOT_COUNT: "50000"
+
+    command:
+      - etcd
+      - -advertise-client-urls=http://milvus-etcd:2379
+      - -listen-client-urls
+      - http://0.0.0.0:2379
+      - --data-dir
+      - /etcd
+
+    volumes:
+      - milvus_etcd_data:/etcd
+
+    healthcheck:
+      test: ["CMD", "etcdctl", "--endpoints=http://localhost:2379", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  milvus:
+    image: milvusdb/milvus:v2.6.23
+    restart: unless-stopped
+
+    command: ["milvus", "run", "standalone"]
+
+    security_opt:
+      - seccomp:unconfined
+
+    environment:
+      ETCD_ENDPOINTS: milvus-etcd:2379
+      COMMON_STORAGETYPE: local
+      DEPLOY_MODE: STANDALONE
+
+    volumes:
+      - milvus_data:/var/lib/milvus
+
+    ports:
+      - "127.0.0.1:19530:19530"
+      - "127.0.0.1:9091:9091"
+
+    depends_on:
+      milvus-etcd:
+        condition: service_healthy
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      timeout: 20s
+      retries: 5
+      start_period: 90s
+
+  # Logical service 2: one OpenAI-compatible model gateway.
+  # Internally it starts two vLLM processes because a vLLM server instance
+  # can run only one model/runner: BGE-M3 for /v1/embeddings and a generator
+  # for /v1/chat/completions / Responses API.
+  model-service:
+    build: ./model-service
+    restart: unless-stopped
+    ipc: host
+    shm_size: "8gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${MODEL_GPU_ID:-2}"]
+              capabilities: [gpu]
+    environment:
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
+      HF_TOKEN: ${HUGGING_FACE_HUB_TOKEN:-}
+      MODEL_API_KEY: ${MODEL_API_KEY:-movie-agent-local}
+
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-m3}
+      EMBEDDING_SERVED_MODEL_NAME: ${EMBEDDING_SERVED_MODEL_NAME:-BAAI/bge-m3}
+      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-1024}
+      EMBEDDING_GPU_MEMORY_UTILIZATION: ${EMBEDDING_GPU_MEMORY_UTILIZATION:-0.10}
+      EMBEDDING_MAX_MODEL_LEN: ${EMBEDDING_MAX_MODEL_LEN:-8192}
+      EMBEDDING_MAX_NUM_SEQS: ${EMBEDDING_MAX_NUM_SEQS:-16}
+
+      GENERATOR_MODEL: ${GENERATOR_MODEL:-cyankiwi/gemma-4-26B-A4B-it-AWQ-8bit}
+      GENERATOR_SERVED_MODEL_NAME: ${GENERATOR_SERVED_MODEL_NAME:-movie-agent-generator}
+      GENERATOR_GPU_MEMORY_UTILIZATION: ${GENERATOR_GPU_MEMORY_UTILIZATION:-0.80}
+      GENERATOR_MAX_MODEL_LEN: ${GENERATOR_MAX_MODEL_LEN:-32768}
+      GENERATOR_MAX_NUM_SEQS: ${GENERATOR_MAX_NUM_SEQS:-16}
+      GENERATOR_TOOL_CALL_PARSER: ${GENERATOR_TOOL_CALL_PARSER:-gemma4}
+      GENERATOR_REASONING_PARSER: ${GENERATOR_REASONING_PARSER:-gemma4}
+      GENERATOR_EXTRA_ARGS: ${GENERATOR_EXTRA_ARGS:-}
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    ports:
+      - "127.0.0.1:${MODEL_PORT:-8002}:8000"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready', timeout=5)"]
+      interval: 15s
+      timeout: 8s
+      retries: 40
+      start_period: 120s
+
+  # Logical service 3: hybrid retrieval API used as an external agent tool.
+  vector-app:
+    build: ./movie-vector-app
+    restart: "on-failure:5"
+    depends_on:
+      db:
+        condition: service_healthy
+      app:
+        condition: service_healthy
+      milvus:
+        condition: service_healthy
+      model-service:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${VECTOR_APP_PORT:-8003}:8000"
+    environment:
+      API_KEY: ${API_KEY:-}
+
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-movies}
+      POSTGRES_USER: ${POSTGRES_USER:-movies}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-movies_local}
+
+      MILVUS_URI: http://milvus:19530
+      MILVUS_COLLECTION: ${MILVUS_COLLECTION:-movies_hybrid_v2}
+      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-1024}
+
+      MODEL_BASE_URL: http://model-service:8000/v1
+      MODEL_API_KEY: ${MODEL_API_KEY:-movie-agent-local}
+      EMBEDDING_MODEL: ${EMBEDDING_SERVED_MODEL_NAME:-BAAI/bge-m3}
+
+      INDEX_BATCH_SIZE: ${INDEX_BATCH_SIZE:-64}
+      SEARCH_CANDIDATE_MULTIPLIER: ${SEARCH_CANDIDATE_MULTIPLIER:-4}
+      RRF_K: ${RRF_K:-60}
+      AUTO_INDEX_ON_START: ${AUTO_INDEX_ON_START:-true}
+      INDEX_IF_EMPTY_ONLY: ${INDEX_IF_EMPTY_ONLY:-true}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+  mcp-server:
+    build: ./mcp-server
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      vector-app:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-movies}
+      POSTGRES_USER: ${POSTGRES_USER:-movies}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-movies_local}
+
+      VECTOR_APP_URL: http://vector-app:8000
+      API_KEY: ${API_KEY:-}
+      FUZZY_THRESHOLD: ${FUZZY_THRESHOLD:-0.30}
+      QUERY_TIMEOUT_MS: ${QUERY_TIMEOUT_MS:-5000}
+      MAX_SEARCH_LIMIT: ${MAX_SEARCH_LIMIT:-100}
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: 8000
+    ports:
+      - "127.0.0.1:${MCP_PORT:-8004}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+      
+volumes:
+  pg_data:
+  app_data:
+  milvus_data:
+  milvus_etcd_data:
