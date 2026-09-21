@@ -1,7 +1,16 @@
+name: movie-agent
+
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   db:
     image: postgres:17-bookworm
     restart: unless-stopped
+    logging: *default-logging
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-movies}
       POSTGRES_USER: ${POSTGRES_USER:-movies}
@@ -9,7 +18,7 @@ services:
     volumes:
       - pg_data:/var/lib/postgresql/data
     ports:
-    - 5433:5432
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5433}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
       interval: 5s
@@ -20,7 +29,10 @@ services:
   # Existing structured/fuzzy movie DB API.
   app:
     build: ./movie-db-app
-    restart: "on-failure:3"
+    init: true
+    restart: unless-stopped
+    logging: *default-logging
+    stop_grace_period: 20s
     depends_on:
       db:
         condition: service_healthy
@@ -58,6 +70,7 @@ services:
   milvus-etcd:
     image: gcr.io/etcd-development/etcd:v3.5.25
     restart: unless-stopped
+    logging: *default-logging
 
     environment:
       ETCD_AUTO_COMPACTION_MODE: revision
@@ -86,6 +99,7 @@ services:
   milvus:
     image: milvusdb/milvus:v2.6.23
     restart: unless-stopped
+    logging: *default-logging
 
     command: ["milvus", "run", "standalone"]
 
@@ -121,7 +135,10 @@ services:
   # for /v1/chat/completions / Responses API.
   model-service:
     build: ./model-service
+    init: true
     restart: unless-stopped
+    logging: *default-logging
+    stop_grace_period: 60s
     ipc: host
     shm_size: "8gb"
     deploy:
@@ -165,7 +182,10 @@ services:
   # Logical service 3: hybrid retrieval API used as an external agent tool.
   vector-app:
     build: ./movie-vector-app
-    restart: "on-failure:5"
+    init: true
+    restart: unless-stopped
+    logging: *default-logging
+    stop_grace_period: 20s
     depends_on:
       app:
         condition: service_healthy
@@ -192,6 +212,8 @@ services:
       INDEX_SOURCE_PAGE_SIZE: ${INDEX_SOURCE_PAGE_SIZE:-500}
       SEARCH_CANDIDATE_MULTIPLIER: ${SEARCH_CANDIDATE_MULTIPLIER:-4}
       RRF_K: ${RRF_K:-60}
+      SEMANTIC_ACCEPT_NORMALIZED_SCORE: ${SEMANTIC_ACCEPT_NORMALIZED_SCORE:-0.25}
+      SEMANTIC_STRONG_NORMALIZED_SCORE: ${SEMANTIC_STRONG_NORMALIZED_SCORE:-0.45}
       AUTO_INDEX_ON_START: ${AUTO_INDEX_ON_START:-true}
       INDEX_IF_EMPTY_ONLY: ${INDEX_IF_EMPTY_ONLY:-true}
     healthcheck:
@@ -202,7 +224,10 @@ services:
       start_period: 30s
   mcp-server:
     build: ./mcp-server
+    init: true
     restart: unless-stopped
+    logging: *default-logging
+    stop_grace_period: 20s
     depends_on:
       app:
         condition: service_healthy
@@ -230,7 +255,10 @@ services:
   # through movie-db-app internal runtime endpoints.
   conversation-service:
     build: ./conversation-service
-    restart: "on-failure:5"
+    init: true
+    restart: unless-stopped
+    logging: *default-logging
+    stop_grace_period: 20s
     depends_on:
       app:
         condition: service_healthy
@@ -252,6 +280,7 @@ services:
       AGENT_REASONING_EFFORT: ${AGENT_REASONING_EFFORT:-medium}
       PLANNER_MAX_TOKENS: ${PLANNER_MAX_TOKENS:-1200}
       AGENT_MAX_TOKENS: ${AGENT_MAX_TOKENS:-2400}
+      RECOVERY_AGENT_MAX_TOKENS: ${RECOVERY_AGENT_MAX_TOKENS:-1600}
 
       MAX_AGENT_ITERATIONS: ${MAX_AGENT_ITERATIONS:-8}
       MAX_TOOL_CALLS: ${MAX_TOOL_CALLS:-10}
@@ -259,7 +288,15 @@ services:
       MCP_TRANSPORT_RETRIES: ${MCP_TRANSPORT_RETRIES:-3}
       MCP_RETRY_BASE_SECONDS: ${MCP_RETRY_BASE_SECONDS:-0.5}
 
-      CONVERSATION_HISTORY_LIMIT: ${CONVERSATION_HISTORY_LIMIT:-20}
+      CONVERSATION_HISTORY_TURNS: ${CONVERSATION_HISTORY_TURNS:-3}
+      RECOVERY_PREVIOUS_TURNS: ${RECOVERY_PREVIOUS_TURNS:-1}
+      MEMORY_COMPACTION_ENABLED: ${MEMORY_COMPACTION_ENABLED:-true}
+      MEMORY_COMPACTION_MIN_MESSAGES: ${MEMORY_COMPACTION_MIN_MESSAGES:-2}
+      MEMORY_COMPACTION_MAX_TOKENS: ${MEMORY_COMPACTION_MAX_TOKENS:-1000}
+      MEMORY_COMPACTION_MESSAGE_LIMIT: ${MEMORY_COMPACTION_MESSAGE_LIMIT:-200}
+      MEMORY_COMPACTION_MAX_CHARS: ${MEMORY_COMPACTION_MAX_CHARS:-16000}
+      FUZZY_ACCEPT_SIMILARITY: ${FUZZY_ACCEPT_SIMILARITY:-0.50}
+      FUZZY_STRONG_SIMILARITY: ${FUZZY_STRONG_SIMILARITY:-0.75}
       SCHEMA_CACHE_TTL_SECONDS: ${SCHEMA_CACHE_TTL_SECONDS:-900}
       MODEL_TIMEOUT_SECONDS: ${MODEL_TIMEOUT_SECONDS:-180}
       DB_TIMEOUT_SECONDS: ${DB_TIMEOUT_SECONDS:-15}
@@ -275,7 +312,10 @@ services:
   # Thin Streamlit integration/test UI. It talks only to the conversation service.
   streamlit-app:
     build: ./streamlit-app
+    init: true
     restart: unless-stopped
+    logging: *default-logging
+    stop_grace_period: 20s
     depends_on:
       conversation-service:
         condition: service_healthy
@@ -285,6 +325,12 @@ services:
       STREAMLIT_REQUEST_TIMEOUT_SECONDS: ${STREAMLIT_REQUEST_TIMEOUT_SECONDS:-300}
     ports:
       - "127.0.0.1:${STREAMLIT_PORT:-8501}:8501"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
 
 volumes:
   pg_data:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -24,8 +24,18 @@ class Settings(BaseSettings):
     index_source_page_size: int = Field(default=500, ge=1, le=1000)
     search_candidate_multiplier: int = Field(default=4, ge=1, le=20)
     rrf_k: int = Field(default=60, ge=1, le=1000)
+    semantic_accept_normalized_score: float = Field(default=0.25, ge=0.0, le=1.0)
+    semantic_strong_normalized_score: float = Field(default=0.45, ge=0.0, le=1.0)
     auto_index_on_start: bool = True
     index_if_empty_only: bool = True
+
+    @model_validator(mode="after")
+    def validate_thresholds(self) -> "Settings":
+        if self.semantic_strong_normalized_score < self.semantic_accept_normalized_score:
+            raise ValueError(
+                "SEMANTIC_STRONG_NORMALIZED_SCORE must be >= SEMANTIC_ACCEPT_NORMALIZED_SCORE"
+            )
+        return self
 
 
 @lru_cache(maxsize=1)

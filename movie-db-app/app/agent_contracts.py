@@ -66,14 +66,6 @@ class IntegerRange(StrictModel):
         return self
 
 
-class SearchSort(StrictModel):
-    field: Literal[
-        "title", "release_date", "release_year", "budget", "revenue", "runtime",
-        "vote_average", "vote_count", "popularity", "fuzzy_score"
-    ]
-    direction: Literal["asc", "desc"] = "desc"
-
-
 class DateRange(StrictModel):
     eq: date | None = None
     from_date: date | None = None
@@ -88,12 +80,11 @@ class DateRange(StrictModel):
         return self
 
 
-class AgentMovieSearchRequest(StrictModel):
-    """High-level movie criteria used by the agent/MCP integration.
+class MovieFilterCriteria(StrictModel):
+    """Structured SQL-searchable movie criteria.
 
-    Criteria across fields are ANDed. Multiple values inside a StringSetFilter use
-    its explicit `match` mode. Title/original-title/tagline and person-name criteria
-    are fuzzy matched by the DB service itself.
+    Overview is intentionally absent. Plot/overview meaning must be handled by semantic
+    retrieval through the vector service.
     """
 
     movie_ids: list[int] = Field(default_factory=list, max_length=50)
@@ -110,6 +101,7 @@ class AgentMovieSearchRequest(StrictModel):
     cast: StringSetFilter | None = None
     crew: StringSetFilter | None = None
 
+    # cast.character is fuzzy. Crew department/job remain literal containment filters.
     cast_characters: StringSetFilter | None = None
     crew_departments: StringSetFilter | None = None
     crew_jobs: StringSetFilter | None = None
@@ -126,12 +118,7 @@ class AgentMovieSearchRequest(StrictModel):
     vote_count: IntegerRange | None = None
 
     homepage_contains: str | None = Field(default=None, max_length=500)
-    overview_contains: str | None = Field(default=None, max_length=1000)
-
-    sort: list[SearchSort] = Field(default_factory=list, max_length=3)
-
     fuzzy_threshold: float | None = Field(default=None, gt=0.0, le=1.0)
-    limit: int = Field(default=20, ge=1, le=100)
 
     @field_validator("movie_ids")
     @classmethod
@@ -146,17 +133,42 @@ class AgentMovieSearchRequest(StrictModel):
         cleaned = [" ".join(value.split()) for value in values if value and value.strip()]
         return list(dict.fromkeys(cleaned))
 
+    def has_filters(self) -> bool:
+        ignored = {"fuzzy_threshold"}
+        data = self.model_dump()
+        return any(
+            data.get(name) not in (None, [], "")
+            for name in MovieFilterCriteria.model_fields
+            if name not in ignored
+        )
+
+
+class SearchSort(StrictModel):
+    field: Literal[
+        "title", "release_date", "release_year", "budget", "revenue", "runtime",
+        "vote_average", "vote_count", "popularity", "fuzzy_score"
+    ]
+    direction: Literal["asc", "desc"] = "desc"
+
+
+class AgentMovieSearchRequest(MovieFilterCriteria):
+    """High-level movie retrieval criteria used by the agent/MCP integration."""
+
+    sort: list[SearchSort] = Field(default_factory=list, max_length=3)
+    limit: int = Field(default=20, ge=1, le=100)
+
     @model_validator(mode="after")
     def require_filter(self) -> "AgentMovieSearchRequest":
-        ignored = {"limit", "fuzzy_threshold", "sort"}
-        supplied = [
-            name
-            for name, value in self.model_dump().items()
-            if name not in ignored and value not in (None, [], "")
-        ]
-        if not supplied:
+        if not self.has_filters():
             raise ValueError("At least one structured search criterion is required")
         return self
+
+
+class FuzzyMatchEvidence(StrictModel):
+    field: str
+    query: str
+    matched_value: str
+    similarity: float = Field(ge=0.0, le=1.0)
 
 
 class AgentMovieSearchHit(StrictModel):
@@ -173,7 +185,10 @@ class AgentMovieSearchHit(StrictModel):
     popularity: float | None = None
     vote_average: float | None = None
     vote_count: int | None = None
+    # Backward-compatible title/original-title/tagline ranking score.
     fuzzy_score: float | None = None
+    # Per fuzzy-capable criterion evidence. The agent should use this when judging match quality.
+    fuzzy_matches: list[FuzzyMatchEvidence] = Field(default_factory=list)
     genres: list[str] = Field(default_factory=list)
     keywords: list[str] = Field(default_factory=list)
     production_companies: list[str] = Field(default_factory=list)
@@ -191,6 +206,95 @@ class AgentMovieSearchResponse(StrictModel):
     criteria: dict
     semantic_fallback_recommended: bool = False
     results: list[AgentMovieSearchHit]
+
+
+AnalyticsDimension = Literal[
+    "genre",
+    "keyword",
+    "production_company",
+    "production_country",
+    "spoken_language",
+    "cast_member",
+    "crew_member",
+    "director",
+    "cast_character",
+    "crew_department",
+    "crew_job",
+    "original_language",
+    "status",
+    "release_year",
+]
+AnalyticsMetricField = Literal[
+    "budget",
+    "revenue",
+    "runtime",
+    "vote_average",
+    "vote_count",
+    "popularity",
+]
+
+
+class AnalyticsMetric(StrictModel):
+    function: Literal["count", "sum", "avg", "min", "max"]
+    field: AnalyticsMetricField | None = None
+    alias: str = Field(pattern=r"^[a-z][a-z0-9_]{0,39}$")
+
+    @model_validator(mode="after")
+    def validate_metric(self) -> "AnalyticsMetric":
+        if self.function == "count":
+            if self.field is not None:
+                raise ValueError("count always counts distinct movies; omit field")
+        elif self.field is None:
+            raise ValueError(f"{self.function} requires a numeric movie field")
+        return self
+
+
+class AnalyticsSort(StrictModel):
+    field: str = Field(min_length=1, max_length=60)
+    direction: Literal["asc", "desc"] = "desc"
+
+
+class AgentAnalyticsRequest(StrictModel):
+    """Controlled catalog analytics with automatic joins owned by movie-db-app.
+
+    `group_by` may contain one or more logical dimensions. The DB app creates only
+    allow-listed joins; the caller never supplies SQL/table names/join expressions.
+    """
+
+    filters: MovieFilterCriteria = Field(default_factory=MovieFilterCriteria)
+    group_by: list[AnalyticsDimension] = Field(default_factory=list, max_length=3)
+    metrics: list[AnalyticsMetric] = Field(
+        default_factory=lambda: [AnalyticsMetric(function="count", alias="movie_count")],
+        min_length=1,
+        max_length=6,
+    )
+    sort: list[AnalyticsSort] = Field(default_factory=list, max_length=4)
+    limit: int = Field(default=50, ge=1, le=200)
+    offset: int = Field(default=0, ge=0, le=100_000)
+
+    @model_validator(mode="after")
+    def validate_request(self) -> "AgentAnalyticsRequest":
+        if len(set(self.group_by)) != len(self.group_by):
+            raise ValueError("group_by dimensions must be unique")
+        aliases = [metric.alias for metric in self.metrics]
+        if len(set(aliases)) != len(aliases):
+            raise ValueError("metric aliases must be unique")
+        reserved = set(self.group_by) | {f"{dimension}_id" for dimension in self.group_by}
+        if set(aliases) & reserved:
+            raise ValueError("metric aliases cannot conflict with group-by output fields")
+        return self
+
+
+class AgentAnalyticsResponse(StrictModel):
+    status: Literal["ok", "no_matches"]
+    matched_movie_count: int
+    group_by: list[AnalyticsDimension]
+    metrics: list[dict]
+    total_groups: int
+    returned_count: int
+    has_more: bool
+    filters: dict
+    results: list[dict]
 
 
 class ReferenceResolveRequest(StrictModel):

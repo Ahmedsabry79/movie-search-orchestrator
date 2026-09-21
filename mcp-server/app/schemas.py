@@ -62,14 +62,6 @@ class IntegerRange(BaseModel):
         return self
 
 
-class SearchSort(BaseModel):
-    field: Literal[
-        "title", "release_date", "release_year", "budget", "revenue", "runtime",
-        "vote_average", "vote_count", "popularity", "fuzzy_score"
-    ]
-    direction: Literal["asc", "desc"] = "desc"
-
-
 class DateRange(BaseModel):
     eq: date | None = None
     from_date: date | None = None
@@ -84,13 +76,10 @@ class DateRange(BaseModel):
         return self
 
 
-class DatabaseSearchCriteria(BaseModel):
-    """Structured movie filters extracted from a user request.
+class MovieFilterCriteria(BaseModel):
+    """All SQL-searchable movie criteria exposed to the agent.
 
-    Use title/original_title/tagline only when the user supplied recognizable text
-    from those fields. Those fields are fuzzy matched. Semantic descriptions such
-    as "a movie about..." or "the tagline meant something like..." belong in the
-    semantic search tool instead.
+    Overview is intentionally excluded. Plot/overview/theme meaning must use semantic search.
     """
 
     movie_ids: list[int] = Field(default_factory=list, max_length=50)
@@ -123,17 +112,32 @@ class DatabaseSearchCriteria(BaseModel):
     vote_count: IntegerRange | None = None
 
     homepage_contains: str | None = Field(default=None, max_length=500)
-    overview_contains: str | None = Field(default=None, max_length=1000)
-
-    sort: list[SearchSort] = Field(default_factory=list, max_length=3)
-
     fuzzy_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
-    limit: int = Field(default=20, ge=1, le=100)
 
     @field_validator("titles", "original_titles", "taglines")
     @classmethod
     def clean_fuzzy_lists(cls, values: list[str]) -> list[str]:
         return list(dict.fromkeys(" ".join(v.split()) for v in values if v and v.strip()))
+
+
+class SearchSort(BaseModel):
+    field: Literal[
+        "title", "release_date", "release_year", "budget", "revenue", "runtime",
+        "vote_average", "vote_count", "popularity", "fuzzy_score"
+    ]
+    direction: Literal["asc", "desc"] = "desc"
+
+
+class DatabaseSearchCriteria(MovieFilterCriteria):
+    """Structured movie-list search.
+
+    Use this for explicit DB values. Fuzzy matching is automatic for title,
+    original_title, tagline, cast/crew person names, canonical named relations,
+    and cast.character. Use semantic search for overview/plot meaning.
+    """
+
+    sort: list[SearchSort] = Field(default_factory=list, max_length=3)
+    limit: int = Field(default=20, ge=1, le=100)
 
     @model_validator(mode="after")
     def require_filter(self) -> "DatabaseSearchCriteria":
@@ -146,6 +150,127 @@ class DatabaseSearchCriteria(BaseModel):
         if not supplied:
             raise ValueError("At least one structured search criterion is required")
         return self
+
+
+class FuzzyMatchEvidence(BaseModel):
+    field: str
+    query: str
+    matched_value: str
+    similarity: float
+
+
+class MovieSearchHit(BaseModel):
+    movie_id: int
+    title: str
+    original_title: str | None = None
+    tagline: str | None = None
+    release_date: date | None = None
+    status: str | None = None
+    original_language: str | None = None
+    runtime: float | None = None
+    budget: int | None = None
+    revenue: int | None = None
+    popularity: float | None = None
+    vote_average: float | None = None
+    vote_count: int | None = None
+    fuzzy_score: float | None = None
+    fuzzy_matches: list[FuzzyMatchEvidence] = Field(default_factory=list)
+    genres: list[str] = Field(default_factory=list)
+    keywords: list[str] = Field(default_factory=list)
+    production_companies: list[str] = Field(default_factory=list)
+    production_countries: list[str] = Field(default_factory=list)
+    spoken_languages: list[str] = Field(default_factory=list)
+    cast: list[str] = Field(default_factory=list)
+    crew: list[str] = Field(default_factory=list)
+
+
+class DatabaseSearchResponse(BaseModel):
+    status: Literal["ok", "no_matches"] = "ok"
+    count: int
+    returned_count: int
+    has_more: bool = False
+    criteria: dict
+    semantic_fallback_recommended: bool = False
+    results: list[MovieSearchHit]
+
+
+AnalyticsDimension = Literal[
+    "genre",
+    "keyword",
+    "production_company",
+    "production_country",
+    "spoken_language",
+    "cast_member",
+    "crew_member",
+    "director",
+    "cast_character",
+    "crew_department",
+    "crew_job",
+    "original_language",
+    "status",
+    "release_year",
+]
+AnalyticsMetricField = Literal[
+    "budget",
+    "revenue",
+    "runtime",
+    "vote_average",
+    "vote_count",
+    "popularity",
+]
+
+
+class AnalyticsMetric(BaseModel):
+    function: Literal["count", "sum", "avg", "min", "max"]
+    field: AnalyticsMetricField | None = None
+    alias: str = Field(pattern=r"^[a-z][a-z0-9_]{0,39}$")
+
+    @model_validator(mode="after")
+    def validate_metric(self) -> "AnalyticsMetric":
+        if self.function == "count" and self.field is not None:
+            raise ValueError("count always counts distinct movies; omit field")
+        if self.function != "count" and self.field is None:
+            raise ValueError(f"{self.function} requires a numeric movie field")
+        return self
+
+
+class AnalyticsSort(BaseModel):
+    field: str = Field(min_length=1, max_length=60)
+    direction: Literal["asc", "desc"] = "desc"
+
+
+class DatabaseAnalyticsRequest(BaseModel):
+    filters: MovieFilterCriteria = Field(default_factory=MovieFilterCriteria)
+    group_by: list[AnalyticsDimension] = Field(default_factory=list, max_length=3)
+    metrics: list[AnalyticsMetric] = Field(
+        default_factory=lambda: [AnalyticsMetric(function="count", alias="movie_count")],
+        min_length=1,
+        max_length=6,
+    )
+    sort: list[AnalyticsSort] = Field(default_factory=list, max_length=4)
+    limit: int = Field(default=50, ge=1, le=200)
+    offset: int = Field(default=0, ge=0, le=100_000)
+
+    @model_validator(mode="after")
+    def validate_request(self) -> "DatabaseAnalyticsRequest":
+        if len(set(self.group_by)) != len(self.group_by):
+            raise ValueError("group_by dimensions must be unique")
+        aliases = [metric.alias for metric in self.metrics]
+        if len(set(aliases)) != len(aliases):
+            raise ValueError("metric aliases must be unique")
+        return self
+
+
+class DatabaseAnalyticsResponse(BaseModel):
+    status: Literal["ok", "no_matches"]
+    matched_movie_count: int
+    group_by: list[AnalyticsDimension]
+    metrics: list[dict]
+    total_groups: int
+    returned_count: int
+    has_more: bool
+    filters: dict
+    results: list[dict]
 
 
 class SemanticSearchRequest(BaseModel):
@@ -164,40 +289,6 @@ class SemanticSearchRequest(BaseModel):
         if not value:
             raise ValueError("query cannot be blank")
         return value
-
-
-class MovieSearchHit(BaseModel):
-    movie_id: int
-    title: str
-    original_title: str | None = None
-    tagline: str | None = None
-    release_date: date | None = None
-    status: str | None = None
-    original_language: str | None = None
-    runtime: float | None = None
-    budget: int | None = None
-    revenue: int | None = None
-    popularity: float | None = None
-    vote_average: float | None = None
-    vote_count: int | None = None
-    fuzzy_score: float | None = None
-    genres: list[str] = Field(default_factory=list)
-    keywords: list[str] = Field(default_factory=list)
-    production_companies: list[str] = Field(default_factory=list)
-    production_countries: list[str] = Field(default_factory=list)
-    spoken_languages: list[str] = Field(default_factory=list)
-    cast: list[str] = Field(default_factory=list)
-    crew: list[str] = Field(default_factory=list)
-
-
-class DatabaseSearchResponse(BaseModel):
-    status: Literal["ok", "no_matches"] = "ok"
-    count: int
-    returned_count: int
-    has_more: bool = False
-    criteria: dict
-    semantic_fallback_recommended: bool = False
-    results: list[MovieSearchHit]
 
 
 class ReferenceMatch(BaseModel):
@@ -219,4 +310,7 @@ class SemanticSearchResponse(BaseModel):
     query: str
     mode: str
     count: int
+    accepted_count: int = 0
+    top_quality: Literal["strong", "acceptable", "weak", "unscored", "no_match"] = "no_match"
+    thresholds: dict[str, float] = Field(default_factory=dict)
     results: list[dict]

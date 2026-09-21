@@ -7,7 +7,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 
 from .runtime_contracts import (
-    ConversationCreateRequest,
+    ConversationCreateRequest, ConversationMemoryUpdateRequest,
     EventCreateRequest,
     MessageCreateRequest,
     RunCreateRequest,
@@ -21,6 +21,9 @@ def _conversation(row) -> dict:
         "id": row.id,
         "title": row.title,
         "metadata": row.metadata_json or {},
+        "memory_summary": row.memory_summary,
+        "memory_compacted_through_message_id": row.memory_compacted_through_message_id,
+        "memory_updated_at": row.memory_updated_at,
         "created_at": row.created_at,
         "updated_at": row.updated_at,
     }
@@ -33,6 +36,9 @@ def _message(row) -> dict:
         "role": row.role,
         "content": row.content,
         "metadata": row.metadata_json or {},
+        "memory_summary": row.memory_summary,
+        "memory_compacted_through_message_id": row.memory_compacted_through_message_id,
+        "memory_updated_at": row.memory_updated_at,
         "created_at": row.created_at,
     }
 
@@ -113,6 +119,19 @@ def get_conversation_snapshot(db, conversation_id: str, *, message_limit: int, e
         "events": [_event(row) for row in events],
     }
 
+
+
+def update_conversation_memory(db, conversation_id: str, payload: ConversationMemoryUpdateRequest) -> dict | None:
+    record = db.get(Conversation, conversation_id)
+    if record is None:
+        return None
+    record.memory_summary = payload.summary
+    record.memory_compacted_through_message_id = payload.compacted_through_message_id
+    record.memory_updated_at = datetime.now(timezone.utc)
+    record.updated_at = datetime.now(timezone.utc)
+    db.flush()
+    db.refresh(record)
+    return _conversation(record)
 
 def append_message(db, conversation_id: str, payload: MessageCreateRequest) -> dict | None:
     conversation = db.get(Conversation, conversation_id)

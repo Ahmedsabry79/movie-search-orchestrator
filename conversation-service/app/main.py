@@ -27,6 +27,9 @@ async def lifespan(app: FastAPI):
     runtime = RuntimeStoreClient(settings)
     mcp = MCPGateway(settings)
     model = ModelGateway(settings)
+    # Bootstrap the live MCP tool catalog + authoritative DB schema before serving traffic.
+    # The resulting context is cached and injected into both planner/system prompts.
+    await mcp.get_context(force=True)
     agent = MovieAgent(settings, mcp, model)
     app.state.service = ConversationService(settings, runtime, agent)
     app.state.runtime = runtime

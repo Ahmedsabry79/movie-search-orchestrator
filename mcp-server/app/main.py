@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Literal
 
 import asyncio
 import httpx
@@ -13,8 +13,11 @@ from starlette.responses import JSONResponse
 
 from .config import get_settings
 from .schemas import (
+    DatabaseAnalyticsRequest,
+    DatabaseAnalyticsResponse,
     DatabaseSearchCriteria,
     DatabaseSearchResponse,
+    MovieFilterCriteria,
     ReferenceResolutionResponse,
     ReferenceType,
     SemanticSearchRequest,
@@ -25,7 +28,7 @@ from .schemas import (
 settings = get_settings()
 
 MCP_INSTRUCTIONS = """
-Movie-domain retrieval tools for an LLM agent.
+Movie-domain retrieval and analytics tools for an LLM agent.
 
 Service ownership is strict:
 - PostgreSQL is accessed only through movie-db-app.
@@ -34,23 +37,26 @@ Service ownership is strict:
   and no direct Milvus client logic.
 
 Routing policy:
-1. If the user supplies a title, original title, recognizable literal tagline text,
-   cast name, or crew name, use search_movies_db. Those values are fuzzy matched by
-   movie-db-app.
-2. Use search_movies_db for structured movie fields and relations: genres, keywords,
-   production companies/countries, spoken languages, budget, original language,
-   popularity, release date, revenue, runtime, status, vote average/rating, vote count,
-   cast/crew, cast character, crew department/job, and combinations of these filters.
-3. Use resolve_reference_value when a canonical DB value should be checked or normalized
-   first, e.g. genre, spoken language, country, company, person, status, or original language.
-4. If the request is semantic rather than a literal database value ("movie about ...",
-   "plot where ...", "tagline meant something like ..."), use search_movies_semantic.
-5. If structured/fuzzy DB search returns no convincing result, use semantic search as
-   fallback. Do not start with semantic search when explicit structured criteria exist.
-6. After identifying candidate IDs, use get_movie_details when complete metadata or
-   relationship evidence is needed before answering.
-7. get_database_schema exposes the authoritative DB schema/search semantics. The conversation
-   service preloads this into the system prompt, so do not call it during normal movie search.
+1. FIND/LIST movies with explicit DB criteria -> search_movies_db.
+   Fuzzy-capable inputs are title, original title, literal tagline, named relations,
+   cast/crew person names, and cast.character. Search results return per-field
+   fuzzy_matches with the query, actual DB value, and similarity so the agent can judge quality.
+2. COUNT movies matching criteria without grouping -> count_movies_db.
+3. Dataset-level questions requiring GROUP BY, JOIN-backed dimensions, COUNT/SUM/AVG/MIN/MAX,
+   distributions or breakdowns -> analyze_movies_db. Joins are selected by logical dimensions;
+   never construct SQL yourself. Multiple group_by dimensions are supported.
+4. Use resolve_reference_value when a canonical DB value should be checked or normalized first,
+   e.g. genre, language, country, company, person or status.
+5. Overview is intentionally NOT available to structured SQL search. Any plot/overview/theme
+   meaning, or paraphrased tagline meaning, must use search_movies_semantic.
+6. If structured/fuzzy movie retrieval returns no convincing result, use search_movies_semantic as
+   fallback when a meaningful semantic query can be formed. Hybrid/dense semantic results expose
+   normalized score + quality; weak results are candidates only, not confirmed matches.
+7. After identifying candidate IDs, use get_movie_details when complete metadata/relationship
+   evidence is needed before answering.
+8. get_database_schema exposes the authoritative tables, columns, relationships, searchable
+   structured fields, fuzzy semantics and analytics contract. The conversation service loads it
+   together with the complete MCP tool catalog at startup.
 """.strip()
 
 mcp = MCPServer("movie-agent-tools", instructions=MCP_INSTRUCTIONS)
@@ -107,13 +113,12 @@ async def search_movies_db(criteria: DatabaseSearchCriteria) -> DatabaseSearchRe
 
     The DB app owns all PostgreSQL querying. This tool never issues SQL directly.
     Criteria across fields are combined, while relation value sets honor `match=all`
-    or `match=any`. Title, original-title, tagline, cast, and crew names are fuzzy
-    matched by the DB app. The DB app also searches every normalized relation relevant
-    to movies, including genres, keywords, companies, countries, spoken languages,
-    cast credits and crew credits.
+    or `match=any`. Fuzzy matching is automatic for title, original title, literal tagline,
+    named relations, cast/crew person names, and cast.character. Every returned hit includes
+    `fuzzy_matches` evidence for fuzzy criteria.
 
-    Use semantic search instead for broad meaning such as "movie about a stranded
-    astronaut" unless a structured DB search first failed and fallback is appropriate.
+    Overview/plot text is deliberately excluded from this tool. Use semantic search for
+    meaning such as "movie about a stranded astronaut" or paraphrased overview/tagline clues.
     """
     criteria.limit = min(criteria.limit, settings.max_search_limit)
     payload = criteria.model_dump(mode="json", exclude_none=True, exclude_defaults=True)
@@ -130,13 +135,110 @@ async def search_movies_db(criteria: DatabaseSearchCriteria) -> DatabaseSearchRe
 
 
 @mcp.tool()
-async def search_movies_semantic(request: SemanticSearchRequest) -> SemanticSearchResponse:
-    """Search movie-vector-app by semantic meaning using Milvus hybrid retrieval.
+async def count_movies_db(filters: MovieFilterCriteria | None = None) -> dict:
+    """Count distinct movies matching optional structured criteria through movie-db-app.
 
-    The vector app is the sole Milvus owner. It searches grouped metadata,
-    overview-only, and title+tagline dense embeddings plus BM25 in hybrid mode.
-    Use this when the query is semantic or as fallback after structured search fails.
+    Use this for questions such as "how many movies have rating above 8?" when no grouped
+    breakdown is requested. For "how many in each genre/year/country?", use analyze_movies_db.
+    The same structured/fuzzy filter semantics as search_movies_db apply. Overview is not a
+    structured filter.
     """
+    payload = {
+        "filters": (filters or MovieFilterCriteria()).model_dump(
+            mode="json", exclude_none=True, exclude_defaults=True
+        ),
+        "group_by": [],
+        "metrics": [{"function": "count", "alias": "movie_count"}],
+        "limit": 1,
+        "offset": 0,
+    }
+    data = await _request_json(
+        "POST",
+        f"{settings.db_app_url.rstrip('/')}/agent/analyze",
+        service_name="movie-db-app",
+        json=payload,
+    )
+    try:
+        response = DatabaseAnalyticsResponse.model_validate(data)
+    except ValueError as exc:
+        raise ToolError(f"movie-db-app returned an invalid count response: {exc}") from exc
+    count = 0
+    if response.results:
+        count = int(response.results[0].get("movie_count") or 0)
+    return {
+        "status": response.status,
+        "count": count,
+        "filters": response.filters,
+    }
+
+
+@mcp.tool()
+async def analyze_movies_db(request: DatabaseAnalyticsRequest) -> DatabaseAnalyticsResponse:
+    """Run controlled movie-catalog analytics with automatic allow-listed table joins.
+
+    Use for grouped counts, distributions and numeric aggregates. `group_by` accepts up to
+    three logical dimensions such as genre, keyword, production_company/country,
+    spoken_language, cast_member, crew_member, director, cast_character, crew_department,
+    crew_job, original_language, status, or release_year. Metrics support distinct movie
+    count plus sum/avg/min/max over budget, revenue, runtime, vote_average, vote_count and
+    popularity. Structured filters can be combined with the aggregation.
+
+    Examples:
+    - movies per genre: group_by=["genre"], metric count
+    - average rating by genre and year: group_by=["genre","release_year"], avg vote_average
+    - revenue by production company after 2010: production_company dimension + year filter
+    - movie counts by cast character: group_by=["cast_character"], metric count
+
+    The tool never accepts SQL, table names or join expressions; movie-db-app owns the joins.
+    """
+    request.limit = min(request.limit, 200)
+    payload = request.model_dump(mode="json", exclude_none=True)
+    data = await _request_json(
+        "POST",
+        f"{settings.db_app_url.rstrip('/')}/agent/analyze",
+        service_name="movie-db-app",
+        json=payload,
+    )
+    try:
+        return DatabaseAnalyticsResponse.model_validate(data)
+    except ValueError as exc:
+        raise ToolError(f"movie-db-app returned an invalid analytics response: {exc}") from exc
+
+
+@mcp.tool()
+async def search_movies_semantic(
+    query: Annotated[str, Field(min_length=1, max_length=4000, description="Natural-language semantic movie query")],
+    limit: Annotated[int, Field(ge=1, le=100, description="Maximum number of candidates")] = 10,
+    mode: Annotated[Literal["hybrid", "dense", "bm25"], Field(description="Retrieval mode; hybrid is the default")] = "hybrid",
+    year_from: Annotated[int | None, Field(ge=1870, le=2200)] = None,
+    year_to: Annotated[int | None, Field(ge=1870, le=2200)] = None,
+    min_vote_average: Annotated[float | None, Field(ge=0.0, le=10.0)] = None,
+    genre: Annotated[str | None, Field(max_length=100)] = None,
+) -> SemanticSearchResponse:
+    """Search movie-vector-app by semantic meaning using Milvus retrieval.
+
+    IMPORTANT: arguments are FLAT. Pass `query` directly, e.g.
+    `{"query": "a movie about a blue alien world", "limit": 10}`.
+    Do not wrap arguments inside a `request` object.
+
+    The vector app is the sole Milvus owner. Hybrid mode searches grouped metadata,
+    overview-only, and title+tagline dense embeddings plus BM25. Use this when the
+    request is semantic or as fallback after structured search is weak/no-match.
+    Results include retrieval-quality evidence so the agent can judge candidates.
+    """
+    try:
+        request = SemanticSearchRequest(
+            query=query,
+            limit=limit,
+            mode=mode,
+            year_from=year_from,
+            year_to=year_to,
+            min_vote_average=min_vote_average,
+            genre=genre,
+        )
+    except ValueError as exc:
+        raise ToolError(f"Invalid semantic search request: {exc}") from exc
+
     payload = request.model_dump(mode="json", exclude_none=True)
     data = await _request_json(
         "POST",

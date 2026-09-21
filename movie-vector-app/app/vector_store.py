@@ -35,12 +35,23 @@ class MovieVectorStore:
         "dense_title_tagline",
     )
 
-    def __init__(self, uri: str, collection: str, dimension: int, rrf_k: int, candidate_multiplier: int):
+    def __init__(
+        self,
+        uri: str,
+        collection: str,
+        dimension: int,
+        rrf_k: int,
+        candidate_multiplier: int,
+        semantic_accept_normalized_score: float,
+        semantic_strong_normalized_score: float,
+    ):
         self.client = MilvusClient(uri=uri)
         self.collection = collection
         self.dimension = dimension
         self.rrf_k = rrf_k
         self.candidate_multiplier = candidate_multiplier
+        self.semantic_accept_normalized_score = semantic_accept_normalized_score
+        self.semantic_strong_normalized_score = semantic_strong_normalized_score
 
     def ping(self) -> bool:
         try:
@@ -308,4 +319,26 @@ class MovieVectorStore:
             )
 
         hits = result[0] if result else []
-        return [self._hit_to_dict(hit) for hit in hits]
+        converted = [self._hit_to_dict(hit) for hit in hits]
+
+        # RRF scores are small raw reciprocal-rank sums. Normalize them against
+        # the theoretical rank-1 maximum so quality thresholds are stable when
+        # RRF_K changes and understandable on a 0..1 scale. BM25 scores are not
+        # normalized because their scale is corpus/query dependent.
+        if request.mode in {"hybrid", "dense"}:
+            source_count = len(self.DENSE_FIELDS) + (1 if request.mode == "hybrid" else 0)
+            max_rrf_score = source_count / float(self.rrf_k + 1)
+            for hit in converted:
+                normalized = min(max(hit["score"] / max_rrf_score, 0.0), 1.0) if max_rrf_score else 0.0
+                hit["normalized_score"] = normalized
+                if normalized >= self.semantic_strong_normalized_score:
+                    hit["quality"] = "strong"
+                elif normalized >= self.semantic_accept_normalized_score:
+                    hit["quality"] = "acceptable"
+                else:
+                    hit["quality"] = "weak"
+        else:
+            for hit in converted:
+                hit["normalized_score"] = None
+                hit["quality"] = "unscored"
+        return converted

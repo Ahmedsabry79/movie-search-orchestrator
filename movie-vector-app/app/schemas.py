@@ -29,6 +29,8 @@ class SearchRequest(BaseModel):
 class SearchHit(BaseModel):
     movie_id: int
     score: float
+    normalized_score: float | None = None
+    quality: Literal["strong", "acceptable", "weak", "unscored"] = "unscored"
     title: str
     original_title: str = ""
     tagline: str = ""
@@ -44,6 +46,9 @@ class SearchResponse(BaseModel):
     query: str
     mode: SearchMode
     count: int
+    accepted_count: int = 0
+    top_quality: Literal["strong", "acceptable", "weak", "unscored", "no_match"] = "no_match"
+    thresholds: dict[str, float] = Field(default_factory=dict)
     results: list[SearchHit]
 
 

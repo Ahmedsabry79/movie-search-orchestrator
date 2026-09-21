@@ -38,10 +38,19 @@ class EventCreateRequest(StrictModel):
     payload: dict = Field(default_factory=dict)
 
 
+
+
+class ConversationMemoryUpdateRequest(StrictModel):
+    summary: dict
+    compacted_through_message_id: str = Field(min_length=1, max_length=36)
+
 class ConversationRecord(StrictModel):
     id: str
     title: str | None = None
     metadata: dict = Field(default_factory=dict)
+    memory_summary: dict | None = None
+    memory_compacted_through_message_id: str | None = None
+    memory_updated_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
 

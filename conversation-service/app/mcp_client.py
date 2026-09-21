@@ -102,7 +102,31 @@ class MCPGateway:
             self._context_loaded_at = time.monotonic()
             return context
 
+
+    @staticmethod
+    def _normalize_tool_arguments(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Repair a small set of safe, unambiguous tool-call shape mistakes.
+
+        The semantic tool used to take a nested `request` object. The current MCP
+        schema is intentionally flat, but this compatibility shim prevents an older
+        cached model/tool pattern such as {"request": "Avatr"} from becoming a
+        failed MCP call. It does not guess ambiguous structured-search arguments.
+        """
+        if name != "search_movies_semantic":
+            return arguments
+        request = arguments.get("request")
+        if isinstance(request, str) and request.strip():
+            repaired = {key: value for key, value in arguments.items() if key != "request"}
+            repaired.setdefault("query", request.strip())
+            return repaired
+        if isinstance(request, dict):
+            repaired = dict(request)
+            repaired.update({key: value for key, value in arguments.items() if key != "request"})
+            return repaired
+        return arguments
+
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> MCPToolResult:
+        arguments = self._normalize_tool_arguments(name, arguments)
         last_error: Exception | None = None
         attempts = max(1, self.settings.mcp_transport_retries)
         for attempt in range(1, attempts + 1):

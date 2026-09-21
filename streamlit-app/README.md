@@ -1,9 +1,6 @@
-# Movie Agent Streamlit Test Console
+# Movie Agent Streamlit Integration Console
 
-Thin integration UI for the conversation service. It intentionally owns no agent,
-database, MCP, Milvus, or model logic.
-
-Flow:
+Thin end-to-end UI. It talks only to `conversation-service` and therefore exercises the real agent path rather than bypassing MCP, DB or vector ownership.
 
 ```text
 Streamlit -> conversation-service -> model/MCP -> DB App or Vector App
@@ -11,12 +8,14 @@ Streamlit -> conversation-service -> model/MCP -> DB App or Vector App
 
 The UI can:
 
-- create a persisted conversation;
-- load an existing conversation by ID;
-- display persisted message history;
-- send messages through the SSE endpoint;
-- show plan/tool/fallback/error events while the run executes;
-- optionally show raw tool payloads and the raw SSE trace;
+- create and reload persisted conversations;
+- display persisted chat history;
+- inspect the current structured long-term memory;
+- show live plan, tool, retrieval-quality, fallback, memory-compaction and recovery activity;
+- optionally display tool arguments/results and a bounded SSE trace;
+- stream the final answer token-by-token;
 - display persisted message/run/event counts.
 
-Run with the root compose file and open `http://localhost:8501` by default.
+The activity panel intentionally shows operational summaries rather than raw hidden reasoning.
+
+Run from the root Compose stack and open `http://localhost:8501` by default.

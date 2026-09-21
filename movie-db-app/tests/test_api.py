@@ -247,9 +247,107 @@ def test_agent_runtime_persistence_is_owned_by_db_app(client):
     )
     assert event.status_code == 200, event.text
 
+    memory = client.put(
+        f"/internal/agent-runtime/conversations/{conversation_id}/memory",
+        json={
+            "summary": {"conversation_goal": "Find a movie", "active_constraints": ["science fiction"]},
+            "compacted_through_message_id": message.json()["id"],
+        },
+    )
+    assert memory.status_code == 200, memory.text
+
     snapshot = client.get(f"/internal/agent-runtime/conversations/{conversation_id}")
     assert snapshot.status_code == 200, snapshot.text
     body = snapshot.json()
     assert body["messages"][0]["content"] == "Find Interstellar"
     assert body["runs"][0]["id"] == run_id
     assert body["events"][0]["event_type"] == "tool_started"
+    assert body["conversation"]["memory_summary"]["conversation_goal"] == "Find a movie"
+    assert body["conversation"]["memory_compacted_through_message_id"] == message.json()["id"]
+
+
+def test_agent_cast_character_is_fuzzy(client):
+    response = client.post("/agent/search", json={
+        "cast_characters": {"values": ["Hreo"], "match": "all"},
+        "limit": 5,
+    })
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["results"][0]["movie_id"] in {1, 2, 3, 4}
+    character_evidence = [
+        item for item in body["results"][0]["fuzzy_matches"] if item["field"] == "cast_character"
+    ]
+    assert character_evidence
+    assert character_evidence[0]["matched_value"] == "Hero"
+    assert character_evidence[0]["similarity"] > 0
+
+
+def test_agent_overview_is_semantic_only(client):
+    response = client.post('/agent/search', json={'overview_contains': 'space'})
+    assert response.status_code == 422
+    schema = client.get('/schemas').json()
+    assert schema['search_fields']['structured_movie_columns']['semantic_only'] == ['overview']
+
+
+def test_agent_cast_character_is_fuzzy_and_returns_similarity_evidence(client):
+    response = client.post('/agent/search', json={
+        'cast_characters': {'values': ['Hreo'], 'match': 'all'},
+        'limit': 5,
+    })
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body['status'] == 'ok'
+    assert body['results'][0]['movie_id'] in {1, 2, 3, 4}
+    evidence = body['results'][0]['fuzzy_matches']
+    character = next(item for item in evidence if item['field'] == 'cast_character')
+    assert character['query'] == 'Hreo'
+    assert character['matched_value'] == 'Hero'
+    assert 0 <= character['similarity'] <= 1
+
+
+def test_agent_fuzzy_relation_returns_similarity_evidence(client):
+    response = client.post('/agent/search', json={
+        'titles': ['Interstelar'],
+        'cast': {'values': ['Actor On'], 'match': 'all'},
+    })
+    assert response.status_code == 200, response.text
+    hit = response.json()['results'][0]
+    fields = {item['field'] for item in hit['fuzzy_matches']}
+    assert {'title', 'cast'} <= fields
+
+
+def test_agent_analytics_grouped_count_and_multidimension_join(client):
+    response = client.post('/agent/analyze', json={
+        'group_by': ['genre'],
+        'metrics': [{'function': 'count', 'alias': 'movie_count'}],
+        'sort': [{'field': 'movie_count', 'direction': 'desc'}],
+    })
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body['matched_movie_count'] == 4
+    assert body['total_groups'] == 2
+    assert all(row['movie_count'] == 4 for row in body['results'])
+
+    response = client.post('/agent/analyze', json={
+        'group_by': ['genre', 'release_year'],
+        'metrics': [
+            {'function': 'count', 'alias': 'movie_count'},
+            {'function': 'avg', 'field': 'vote_average', 'alias': 'avg_rating'},
+        ],
+        'limit': 50,
+    })
+    assert response.status_code == 200, response.text
+    rows = response.json()['results']
+    assert rows
+    assert {'genre', 'genre_id', 'release_year', 'movie_count', 'avg_rating'} <= set(rows[0])
+
+
+def test_agent_analytics_accepts_structured_filters(client):
+    response = client.post('/agent/analyze', json={
+        'filters': {'release_year': {'min': 2010}, 'vote_average': {'min': 7.5}},
+        'group_by': ['production_country'],
+        'metrics': [{'function': 'count', 'alias': 'movie_count'}],
+    })
+    assert response.status_code == 200, response.text
+    assert response.json()['matched_movie_count'] >= 1

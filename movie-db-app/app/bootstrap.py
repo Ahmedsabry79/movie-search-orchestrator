@@ -132,6 +132,21 @@ def bootstrap(engine, settings):
         connection.execute(text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
         Base.metadata.create_all(connection)
         AgentBase.metadata.create_all(connection)
+        # Lightweight additive migration for the task's conversation-memory fields.
+        # `create_all` does not alter an already-existing table, so keep this startup
+        # migration idempotent for users upgrading an existing pg_data volume.
+        connection.execute(text(
+            f"ALTER TABLE {AGENT_SCHEMA}.conversations "
+            "ADD COLUMN IF NOT EXISTS memory_summary JSONB"
+        ))
+        connection.execute(text(
+            f"ALTER TABLE {AGENT_SCHEMA}.conversations "
+            "ADD COLUMN IF NOT EXISTS memory_compacted_through_message_id VARCHAR(36)"
+        ))
+        connection.execute(text(
+            f"ALTER TABLE {AGENT_SCHEMA}.conversations "
+            "ADD COLUMN IF NOT EXISTS memory_updated_at TIMESTAMPTZ"
+        ))
         validate_existing_columns(connection)
         state = connection.execute(select(DatasetState.__table__).where(DatasetState.id == 1)).mappings().first()
         data_tables = [table for table in Base.metadata.sorted_tables if table.name != "dataset_state"]

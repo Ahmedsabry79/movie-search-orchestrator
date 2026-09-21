@@ -9,20 +9,21 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
-from .agent_contracts import AgentMovieSearchRequest, ReferenceResolveRequest
+from .agent_contracts import AgentAnalyticsRequest, AgentMovieSearchRequest, ReferenceResolveRequest
 from .agent_search import agent_movie_search, resolve_reference, vector_index_page
+from .analytics import analyze_movies
 from .bootstrap import bootstrap
 from .config import settings as default_settings
 from .contracts import SearchRequest
 from .details import movie_details
 from .schema import schema_details
 from .runtime_contracts import (
-    ConversationCreateRequest, EventCreateRequest, MessageCreateRequest,
+    ConversationCreateRequest, ConversationMemoryUpdateRequest, EventCreateRequest, MessageCreateRequest,
     RunCreateRequest, RunUpdateRequest,
 )
 from .runtime_store import (
     append_event, append_message, create_conversation, create_run,
-    get_conversation_snapshot, update_run_record,
+    get_conversation_snapshot, update_conversation_memory, update_run_record,
 )
 from .search import ResolutionRequired, structured_search
 
@@ -117,6 +118,13 @@ def create_app(settings=default_settings, engine=None):
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    @app.post("/agent/analyze", dependencies=[Depends(authorize)])
+    def agent_analyze(payload: AgentAnalyticsRequest, db=Depends(connection)):
+        try:
+            return analyze_movies(db, payload, settings)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     @app.get("/internal/vector/movies", dependencies=[Depends(authorize)])
     def vector_movies(
         offset: int = Query(default=0, ge=0, le=10_000_000),
@@ -147,6 +155,15 @@ def create_app(settings=default_settings, engine=None):
     @app.post("/internal/agent-runtime/conversations/{conversation_id}/messages", dependencies=[Depends(authorize)])
     def runtime_append_message(conversation_id: str, payload: MessageCreateRequest, db=Depends(runtime_session)):
         result = append_message(db, conversation_id, payload)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        return result
+
+    @app.put("/internal/agent-runtime/conversations/{conversation_id}/memory", dependencies=[Depends(authorize)])
+    def runtime_update_memory(
+        conversation_id: str, payload: ConversationMemoryUpdateRequest, db=Depends(runtime_session)
+    ):
+        result = update_conversation_memory(db, conversation_id, payload)
         if result is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
         return result

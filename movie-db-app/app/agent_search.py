@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from sqlalchemy import Date, Integer, and_, case, cast, exists, func, literal, or_, select
+from collections import defaultdict
+
+from sqlalchemy import Date, Integer, and_, case, cast, exists, func, literal, or_, select, union_all
 from sqlalchemy.orm import Session, selectinload
 
 from preprocessing import normalize_text
@@ -8,6 +10,8 @@ from .agent_contracts import (
     AgentMovieSearchHit,
     AgentMovieSearchRequest,
     AgentMovieSearchResponse,
+    FuzzyMatchEvidence,
+    MovieFilterCriteria,
     ReferenceMatch,
     ReferenceResolveRequest,
     ReferenceResolutionResponse,
@@ -37,25 +41,13 @@ NAMED_RELATIONS = {
     "genres": (Genre.__table__, movie_genres, "genre_id", "id", None),
     "keywords": (Keyword.__table__, movie_keywords, "keyword_id", "id", None),
     "production_companies": (
-        Company.__table__,
-        movie_production_companies,
-        "company_id",
-        "id",
-        None,
+        Company.__table__, movie_production_companies, "company_id", "id", None,
     ),
     "production_countries": (
-        Country.__table__,
-        movie_production_countries,
-        "country_iso_3166_1",
-        "iso_3166_1",
-        "iso_3166_1",
+        Country.__table__, movie_production_countries, "country_iso_3166_1", "iso_3166_1", "iso_3166_1",
     ),
     "spoken_languages": (
-        Language.__table__,
-        movie_spoken_languages,
-        "language_iso_639_1",
-        "iso_639_1",
-        "iso_639_1",
+        Language.__table__, movie_spoken_languages, "language_iso_639_1", "iso_639_1", "iso_639_1",
     ),
 }
 
@@ -78,11 +70,21 @@ def _similarity(column, normalized: str):
     )
 
 
+def _fuzzy_score(column, normalized: str):
+    return case((column == normalized, 1.0), else_=_similarity(column, normalized))
+
+
 def _fuzzy_predicate(column, normalized: str, threshold: float):
     parts = [column == normalized, column.contains(normalized)]
     if len(normalized) >= 3:
         parts.append(_similarity(column, normalized) >= threshold)
     return or_(*parts)
+
+
+def _credit_search_expression(column):
+    # Credits do not currently have materialized *_search columns. Normalize whitespace
+    # and case inside PostgreSQL so character names can still use the same pg_trgm logic.
+    return func.lower(func.regexp_replace(func.btrim(func.coalesce(column, "")), r"\s+", " ", "g"))
 
 
 def _text_group(column, values: list[str], threshold: float):
@@ -105,11 +107,7 @@ def _named_relation_condition(value_filter: StringSetFilter, relation_name: str,
         if code_column:
             name_match = or_(name_match, func.lower(entity.c[code_column]) == normalized)
         predicates.append(
-            exists(
-                select(1)
-                .select_from(join)
-                .where(link.c.movie_id == Movie.id, name_match)
-            )
+            exists(select(1).select_from(join).where(link.c.movie_id == Movie.id, name_match))
         )
     return _combine_relation_values(value_filter, predicates)
 
@@ -133,11 +131,24 @@ def _people_condition(value_filter: StringSetFilter, *, cast_credit: bool, thres
     return _combine_relation_values(value_filter, predicates)
 
 
+def _credit_fuzzy_condition(value_filter: StringSetFilter, *, table, column, threshold: float):
+    searchable = _credit_search_expression(column)
+    predicates = []
+    for value in value_filter.values:
+        normalized = normalize_text(value)
+        predicates.append(
+            exists(
+                select(1)
+                .select_from(table)
+                .where(table.c.movie_id == Movie.id, _fuzzy_predicate(searchable, normalized, threshold))
+            )
+        )
+    return _combine_relation_values(value_filter, predicates)
+
+
 def _credit_text_condition(value_filter: StringSetFilter, *, table, column):
     predicates = []
     for value in value_filter.values:
-        # Credit text does not have a materialized normalized helper column, so use
-        # case-insensitive containment. Person names are handled separately with pg_trgm.
         query = " ".join(value.split())
         predicates.append(
             exists(
@@ -168,57 +179,12 @@ def _scalar_string_condition(column, value_filter: StringSetFilter | None):
         return None
     values = [normalize_text(value) for value in value_filter.values]
     lowered = func.lower(func.coalesce(column, ""))
-    # A scalar column cannot simultaneously equal several distinct values. Treat
-    # multiple supplied values as allowed alternatives regardless of match mode.
     return or_(*[lowered == value for value in values])
 
 
-def _movie_options():
-    return (
-        selectinload(Movie.genres),
-        selectinload(Movie.keywords),
-        selectinload(Movie.production_companies),
-        selectinload(Movie.production_countries),
-        selectinload(Movie.spoken_languages),
-        selectinload(Movie.cast).selectinload(CastCredit.person),
-        selectinload(Movie.crew).selectinload(CrewCredit.person),
-    )
-
-
-def _names(items):
-    return sorted({item.name for item in items if item.name})
-
-
-def _movie_to_hit(movie: Movie, fuzzy_score: float | None) -> AgentMovieSearchHit:
-    return AgentMovieSearchHit(
-        movie_id=movie.id,
-        title=movie.title,
-        original_title=movie.original_title,
-        tagline=movie.tagline,
-        release_date=movie.release_date.date() if movie.release_date else None,
-        status=movie.status,
-        original_language=movie.original_language,
-        runtime=movie.runtime,
-        budget=movie.budget,
-        revenue=movie.revenue,
-        popularity=movie.popularity,
-        vote_average=movie.vote_average,
-        vote_count=movie.vote_count,
-        fuzzy_score=fuzzy_score,
-        genres=_names(movie.genres),
-        keywords=_names(movie.keywords),
-        production_companies=_names(movie.production_companies),
-        production_countries=_names(movie.production_countries),
-        spoken_languages=_names(movie.spoken_languages),
-        cast=sorted({credit.person.name for credit in movie.cast if credit.person and credit.person.name}),
-        crew=sorted({credit.person.name for credit in movie.crew if credit.person and credit.person.name}),
-    )
-
-
-def agent_movie_search(connection, criteria: AgentMovieSearchRequest, settings) -> AgentMovieSearchResponse:
-    threshold = criteria.fuzzy_threshold or settings.fuzzy_threshold
+def build_movie_predicates(criteria: MovieFilterCriteria, threshold: float) -> list:
+    """Build allow-listed SQL predicates for structured retrieval/analytics."""
     predicates = []
-
     if criteria.movie_ids:
         predicates.append(Movie.id.in_(criteria.movie_ids))
 
@@ -245,13 +211,13 @@ def agent_movie_search(connection, criteria: AgentMovieSearchRequest, settings) 
         predicates.append(_people_condition(criteria.cast, cast_credit=True, threshold=threshold))
     if criteria.crew is not None:
         predicates.append(_people_condition(criteria.crew, cast_credit=False, threshold=threshold))
-
     if criteria.cast_characters is not None:
         predicates.append(
-            _credit_text_condition(
+            _credit_fuzzy_condition(
                 criteria.cast_characters,
                 table=CastCredit.__table__,
                 column=CastCredit.__table__.c.character,
+                threshold=threshold,
             )
         )
     if criteria.crew_departments is not None:
@@ -300,8 +266,185 @@ def agent_movie_search(connection, criteria: AgentMovieSearchRequest, settings) 
 
     if criteria.homepage_contains:
         predicates.append(Movie.homepage.ilike(f"%{criteria.homepage_contains.strip()}%"))
-    if criteria.overview_contains:
-        predicates.append(Movie.overview.ilike(f"%{criteria.overview_contains.strip()}%"))
+    return predicates
+
+
+def _movie_options():
+    return (
+        selectinload(Movie.genres),
+        selectinload(Movie.keywords),
+        selectinload(Movie.production_companies),
+        selectinload(Movie.production_countries),
+        selectinload(Movie.spoken_languages),
+        selectinload(Movie.cast).selectinload(CastCredit.person),
+        selectinload(Movie.crew).selectinload(CrewCredit.person),
+    )
+
+
+def _names(items):
+    return sorted({item.name for item in items if item.name})
+
+
+def _evidence_statements(movie_ids: list[int], criteria: MovieFilterCriteria, threshold: float):
+    statements = []
+
+    for field, search_col, display_col, values in (
+        ("title", Movie.title_search, Movie.title, criteria.titles),
+        ("original_title", Movie.original_title_search, Movie.original_title, criteria.original_titles),
+        ("tagline", Movie.tagline_search, Movie.tagline, criteria.taglines),
+    ):
+        for query in values:
+            normalized = normalize_text(query)
+            statements.append(
+                select(
+                    Movie.id.label("movie_id"),
+                    literal(field).label("field"),
+                    literal(query).label("query"),
+                    func.coalesce(display_col, "").label("matched_value"),
+                    _fuzzy_score(search_col, normalized).label("similarity"),
+                ).where(Movie.id.in_(movie_ids), _fuzzy_predicate(search_col, normalized, threshold))
+            )
+
+    for field, value_filter, relation_name in (
+        ("genre", criteria.genres, "genres"),
+        ("keyword", criteria.keywords, "keywords"),
+        ("production_company", criteria.production_companies, "production_companies"),
+        ("production_country", criteria.production_countries, "production_countries"),
+        ("spoken_language", criteria.spoken_languages, "spoken_languages"),
+    ):
+        if value_filter is None:
+            continue
+        entity, link, relation_fk, entity_pk, code_column = NAMED_RELATIONS[relation_name]
+        joined = link.join(entity, entity.c[entity_pk] == link.c[relation_fk])
+        for query in value_filter.values:
+            normalized = normalize_text(query)
+            predicate = _fuzzy_predicate(entity.c.name_search, normalized, threshold)
+            score = _fuzzy_score(entity.c.name_search, normalized)
+            if code_column:
+                code_exact = func.lower(entity.c[code_column]) == normalized
+                predicate = or_(predicate, code_exact)
+                score = case((code_exact, 1.0), else_=score)
+            statements.append(
+                select(
+                    link.c.movie_id.label("movie_id"),
+                    literal(field).label("field"),
+                    literal(query).label("query"),
+                    func.coalesce(entity.c.name, entity.c[code_column] if code_column else "").label("matched_value"),
+                    score.label("similarity"),
+                )
+                .select_from(joined)
+                .where(link.c.movie_id.in_(movie_ids), predicate)
+            )
+
+    for field, value_filter, credit in (
+        ("cast", criteria.cast, CastCredit.__table__),
+        ("crew", criteria.crew, CrewCredit.__table__),
+    ):
+        if value_filter is None:
+            continue
+        joined = credit.join(Person.__table__, Person.id == credit.c.person_id)
+        for query in value_filter.values:
+            normalized = normalize_text(query)
+            statements.append(
+                select(
+                    credit.c.movie_id.label("movie_id"),
+                    literal(field).label("field"),
+                    literal(query).label("query"),
+                    func.coalesce(Person.__table__.c.name, "").label("matched_value"),
+                    _fuzzy_score(Person.__table__.c.name_search, normalized).label("similarity"),
+                )
+                .select_from(joined)
+                .where(
+                    credit.c.movie_id.in_(movie_ids),
+                    _fuzzy_predicate(Person.__table__.c.name_search, normalized, threshold),
+                )
+            )
+
+    if criteria.cast_characters is not None:
+        searchable = _credit_search_expression(CastCredit.__table__.c.character)
+        for query in criteria.cast_characters.values:
+            normalized = normalize_text(query)
+            statements.append(
+                select(
+                    CastCredit.__table__.c.movie_id.label("movie_id"),
+                    literal("cast_character").label("field"),
+                    literal(query).label("query"),
+                    func.coalesce(CastCredit.__table__.c.character, "").label("matched_value"),
+                    _fuzzy_score(searchable, normalized).label("similarity"),
+                ).where(
+                    CastCredit.__table__.c.movie_id.in_(movie_ids),
+                    _fuzzy_predicate(searchable, normalized, threshold),
+                )
+            )
+    return statements
+
+
+def _fuzzy_evidence(connection, movie_ids: list[int], criteria: MovieFilterCriteria, threshold: float):
+    evidence: dict[int, list[FuzzyMatchEvidence]] = defaultdict(list)
+    statements = _evidence_statements(movie_ids, criteria, threshold)
+    if not statements:
+        return evidence
+    combined = union_all(*statements).subquery()
+    rows = connection.execute(
+        select(combined)
+        .order_by(
+            combined.c.movie_id.asc(),
+            combined.c.field.asc(),
+            combined.c.query.asc(),
+            combined.c.similarity.desc(),
+        )
+    ).mappings().all()
+    seen: set[tuple[int, str, str]] = set()
+    for row in rows:
+        key = (int(row["movie_id"]), row["field"], row["query"])
+        if key in seen:
+            continue
+        seen.add(key)
+        evidence[key[0]].append(
+            FuzzyMatchEvidence(
+                field=row["field"],
+                query=row["query"],
+                matched_value=row["matched_value"] or "",
+                similarity=max(0.0, min(1.0, float(row["similarity"] or 0.0))),
+            )
+        )
+    return evidence
+
+
+def _movie_to_hit(
+    movie: Movie,
+    fuzzy_score: float | None,
+    fuzzy_matches: list[FuzzyMatchEvidence],
+) -> AgentMovieSearchHit:
+    return AgentMovieSearchHit(
+        movie_id=movie.id,
+        title=movie.title,
+        original_title=movie.original_title,
+        tagline=movie.tagline,
+        release_date=movie.release_date.date() if movie.release_date else None,
+        status=movie.status,
+        original_language=movie.original_language,
+        runtime=movie.runtime,
+        budget=movie.budget,
+        revenue=movie.revenue,
+        popularity=movie.popularity,
+        vote_average=movie.vote_average,
+        vote_count=movie.vote_count,
+        fuzzy_score=fuzzy_score,
+        fuzzy_matches=fuzzy_matches,
+        genres=_names(movie.genres),
+        keywords=_names(movie.keywords),
+        production_companies=_names(movie.production_companies),
+        production_countries=_names(movie.production_countries),
+        spoken_languages=_names(movie.spoken_languages),
+        cast=sorted({credit.person.name for credit in movie.cast if credit.person and credit.person.name}),
+        crew=sorted({credit.person.name for credit in movie.crew if credit.person and credit.person.name}),
+    )
+
+
+def agent_movie_search(connection, criteria: AgentMovieSearchRequest, settings) -> AgentMovieSearchResponse:
+    threshold = criteria.fuzzy_threshold or settings.fuzzy_threshold
+    predicates = build_movie_predicates(criteria, threshold)
 
     score_parts = []
     for column, values in (
@@ -310,7 +453,7 @@ def agent_movie_search(connection, criteria: AgentMovieSearchRequest, settings) 
         (Movie.tagline_search, criteria.taglines),
     ):
         for value in values:
-            score_parts.append(_similarity(column, normalize_text(value)))
+            score_parts.append(_fuzzy_score(column, normalize_text(value)))
     score = func.greatest(*score_parts) if score_parts else literal(None)
 
     eligible = select(Movie.id, score.label("fuzzy_score")).where(*predicates)
@@ -348,13 +491,9 @@ def agent_movie_search(connection, criteria: AgentMovieSearchRequest, settings) 
     else:
         if score_parts:
             order.append(score.desc().nulls_last())
-        order.extend(
-            [
-                Movie.vote_average.desc().nulls_last(),
-                Movie.popularity.desc().nulls_last(),
-            ]
-        )
+        order.extend([Movie.vote_average.desc().nulls_last(), Movie.popularity.desc().nulls_last()])
     order.append(Movie.id.asc())
+
     rows = connection.execute(
         select(Movie.id, score.label("fuzzy_score"))
         .where(*predicates)
@@ -363,6 +502,7 @@ def agent_movie_search(connection, criteria: AgentMovieSearchRequest, settings) 
     ).mappings().all()
     ordered_ids = [row["id"] for row in rows]
     scores = {row["id"]: row["fuzzy_score"] for row in rows}
+    evidence = _fuzzy_evidence(connection, ordered_ids, criteria, threshold)
 
     with Session(bind=connection) as session:
         movies = session.scalars(
@@ -370,7 +510,11 @@ def agent_movie_search(connection, criteria: AgentMovieSearchRequest, settings) 
         ).all()
         by_id = {movie.id: movie for movie in movies}
         results = [
-            _movie_to_hit(by_id[movie_id], float(scores[movie_id]) if scores[movie_id] is not None else None)
+            _movie_to_hit(
+                by_id[movie_id],
+                float(scores[movie_id]) if scores[movie_id] is not None else None,
+                evidence.get(movie_id, []),
+            )
             for movie_id in ordered_ids
             if movie_id in by_id
         ]

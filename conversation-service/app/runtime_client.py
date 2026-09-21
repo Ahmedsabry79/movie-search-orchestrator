@@ -46,6 +46,18 @@ class RuntimeStoreClient:
             json={"role": role, "content": content, "metadata": metadata or {}},
         )
 
+    async def update_memory(
+        self, conversation_id: str, *, summary: dict, compacted_through_message_id: str
+    ) -> dict:
+        return await self._json(
+            "PUT",
+            f"/internal/agent-runtime/conversations/{conversation_id}/memory",
+            json={
+                "summary": summary,
+                "compacted_through_message_id": compacted_through_message_id,
+            },
+        )
+
     async def create_run(self, conversation_id: str, *, user_message_id: str | None, plan: dict | None = None) -> dict:
         return await self._json(
             "POST",

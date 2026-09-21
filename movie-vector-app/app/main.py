@@ -43,6 +43,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         dimension=settings.embedding_dimension,
         rrf_k=settings.rrf_k,
         candidate_multiplier=settings.search_candidate_multiplier,
+        semantic_accept_normalized_score=settings.semantic_accept_normalized_score,
+        semantic_strong_normalized_score=settings.semantic_strong_normalized_score,
     )
     indexer = MovieIndexer(repository, embeddings, store, settings.index_batch_size)
 
@@ -126,9 +128,17 @@ async def search_movies(payload: SearchRequest, request: Request) -> SearchRespo
         query_vector = (await embeddings.embed([payload.query]))[0]
 
     results = await asyncio.to_thread(store.search, payload, query_vector)
+    accepted = [item for item in results if item.get("quality") in {"strong", "acceptable", "unscored"}]
+    top_quality = results[0].get("quality", "unscored") if results else "no_match"
     return SearchResponse(
         query=payload.query,
         mode=payload.mode,
         count=len(results),
+        accepted_count=len(accepted),
+        top_quality=top_quality,
+        thresholds={
+            "acceptable_normalized_score": request.app.state.settings.semantic_accept_normalized_score,
+            "strong_normalized_score": request.app.state.settings.semantic_strong_normalized_score,
+        },
         results=results,
     )
