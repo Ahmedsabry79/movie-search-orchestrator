@@ -1,7 +1,0 @@
-fastapi>=0.116,<1.0
-uvicorn[standard]>=0.35,<1.0
-pydantic>=2.11,<3.0
-pydantic-settings>=2.10,<3.0
-openai>=1.99,<2.0
-pymilvus>=2.6.0,<2.7.0
-psycopg[binary]>=3.2,<4.0

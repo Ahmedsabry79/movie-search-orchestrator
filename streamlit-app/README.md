@@ -1,21 +1,22 @@
-# Movie Agent Streamlit Integration Console
+# Streamlit Integration Console
 
-Thin end-to-end UI. It talks only to `conversation-service` and therefore exercises the real agent path rather than bypassing MCP, DB or vector ownership.
+Thin end-to-end test UI for the movie agent. It talks **only** to `conversation-service`.
 
-```text
-Streamlit -> conversation-service -> model/MCP -> DB App or Vector App
-```
+## v4.2 streaming model
 
-The UI can:
+The SSE request runs in a background worker (`run_manager.py`) rather than on the Streamlit script thread. Streamlit reruns therefore do not terminate an active generation.
 
-- create and reload persisted conversations;
-- display persisted chat history;
-- inspect the current structured long-term memory;
-- show live plan, tool, retrieval-quality, fallback, memory-compaction and recovery activity;
-- optionally display tool arguments/results and a bounded SSE trace;
-- stream the final answer token-by-token;
-- display persisted message/run/event counts.
+While a response is generating you can safely:
 
-The activity panel intentionally shows operational summaries rather than raw hidden reasoning.
+- toggle tool payload/debug visibility,
+- create and switch to a new conversation,
+- load a persisted conversation,
+- return to a conversation that is still generating.
 
-Run from the root Compose stack and open `http://localhost:8501` by default.
+The console enforces one active generation per conversation so message ordering remains deterministic. Separate conversations may generate concurrently.
+
+The UI replays safe operational events (plan, tool calls, retrieval quality, fallback, memory compaction, context recovery) and streams the assistant answer incrementally. Raw hidden reasoning is not shown.
+
+## Persistent activity trace
+
+`Show agent activity` is enabled by default and remains stable across Streamlit reruns. Live activity is rendered from the background SSE worker. After completion, activity is rendered from persisted run events associated with the assistant message, so details do not disappear when the final response arrives.

@@ -27,7 +27,6 @@ Useful local endpoints (all bind to loopback by default):
 - MCP server: `8004`
 - conversation service: `8005`
 - Streamlit: `8501`
-- PostgreSQL host port: `5433`
 
 ## Upgrade / rebuild
 
@@ -95,3 +94,96 @@ MEMORY_COMPACTION_MAX_CHARS=16000
 ```
 
 The conversation service also contains a compatibility repair for the previous malformed shape `{"request":"..."}`.
+
+## v4.1 hotfix
+
+Fixes conversation message persistence after the memory-compaction update. Memory fields belong to `agent_runtime.conversations`; message serialization no longer attempts to read them from `agent_runtime.messages`.
+
+## v4.2 reliability / UI update
+
+### Structured-search MCP contract
+
+`search_movies_db` now has a flat MCP schema. Do not wrap arguments in a `criteria` object.
+
+```json
+{
+  "titles": ["Avatr"],
+  "cast": {"values": ["Sam Worthington"], "match": "all"},
+  "release_year": {"min": 2000},
+  "vote_average": {"min": 7.0}
+}
+```
+
+The conversation service keeps compatibility with older/generated shapes and safely repairs common unambiguous shortcuts before MCP validation, including:
+
+- `{"criteria": {...}}` -> flattened search arguments
+- `{"criteria": "Avatr"}` -> `{"titles": ["Avatr"]}`
+- relation string/list -> `{values: [...], match: "all"}`
+- `gte/lte` -> `min/max`
+- scalar numeric range -> `eq`
+- a lone generic `query` on `search_movies_db` -> title fuzzy search
+
+Failed tool cards in Streamlit now show the actual bounded MCP/HTTP validation error by default.
+
+### Non-blocking Streamlit streaming
+
+The Streamlit integration console no longer owns the SSE connection on the UI script thread. A background worker keeps the conversation-service stream alive while Streamlit reruns independently.
+
+This means the following controls can be used while another conversation is generating without cancelling or duplicating the active request:
+
+- New conversation
+- Load conversation
+- Show/hide tool payloads
+- Show/hide debug trace
+- Switch back to a conversation that is still generating
+
+Only one generation is allowed at a time per conversation, preserving message ordering. Different conversations can have background generations concurrently.
+
+### PostgreSQL host exposure
+
+The default Compose stack no longer publishes PostgreSQL to the host. All app services use `db:5432` internally.
+
+For optional host-side SQL debugging:
+
+```bash
+docker compose -f compose.yaml -f compose.debug-db.yaml up -d db
+```
+
+The overlay uses `127.0.0.1:${POSTGRES_HOST_PORT:-5434}:5432`.
+
+## v4.3 sort + persistent activity trace
+
+### Search sort normalization
+
+`search_movies_db.sort` now accepts either canonical structured sort objects or compact shorthand. These are equivalent:
+
+```json
+{"sort": [{"field": "vote_average", "direction": "desc"}]}
+```
+
+```json
+{"sort": "-vote_average"}
+```
+
+```json
+{"sort": ["-vote_average"]}
+```
+
+```json
+{"sort": "vote_average:desc"}
+```
+
+The conversation service normalizes these shapes before tracing/execution, and the MCP tool itself also accepts the shorthand directly. This prevents Pydantic validation failures when the model emits a string sort.
+
+### Streamlit activity persistence
+
+Agent activity is now controlled by a persistent `Show agent activity` preference (enabled by default). The UI no longer auto-collapses the live event panel when generation completes.
+
+Completed assistant messages reconstruct their activity trace from persisted `agent_runtime.events`, so planning/tool/retrieval/recovery details remain reviewable after:
+
+- the final response is ready,
+- a normal Streamlit rerun,
+- loading another conversation and returning,
+- a Streamlit restart.
+
+Tool payload and debug toggles use their own stable `st.session_state` keys and can be changed while an SSE worker is active without terminating generation.

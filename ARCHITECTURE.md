@@ -221,3 +221,17 @@ log rotation, consistent `unless-stopped` restart behavior, init processes for a
 service health checks, and graceful-stop windows. Docker build contexts exclude local caches, virtual
 environments, VCS metadata and `.env` files. Existing PostgreSQL/Milvus volumes are preserved on normal
 rebuilds; `docker compose down -v` remains intentionally destructive.
+
+## v4.2 tool/UI reliability
+
+- `search_movies_db` is a flat MCP tool schema rather than a single nested `criteria` parameter.
+- Conversation orchestration repairs safe legacy/shortcut argument shapes before MCP validation.
+- Streamlit SSE is owned by a background worker; UI reruns and sidebar navigation do not terminate generation.
+- A conversation is single-flight (one active generation), while separate conversations may generate concurrently.
+- The default deployment does not expose PostgreSQL on a host port. `compose.debug-db.yaml` is opt-in for local SQL debugging.
+
+## v4.3 interaction reliability
+
+Structured search sorting is tolerant at both orchestration and MCP boundaries. The preferred form remains `{field, direction}`, while safe shorthand such as `-vote_average`, `+release_year`, and `vote_average:desc` is normalized before `movie-db-app` receives the request. The orchestrator emits the normalized form in `tool_started`, so the visible trace reflects the actual MCP request.
+
+Streamlit keeps SSE generation independent from UI reruns via the existing background worker. Agent activity visibility is now a stable user preference rather than an auto-expanded/auto-collapsed status widget. Once a run is persisted, the UI reconstructs that run's plan/tool/retrieval/recovery trace from `agent_runtime.events` using the assistant message's `metadata.run_id`, so completed execution details remain visible and reloadable with the conversation.

@@ -30,15 +30,18 @@ def _conversation(row) -> dict:
 
 
 def _message(row) -> dict:
+    """Serialize a persisted conversation message.
+
+    Conversation memory belongs to the parent Conversation record, not individual
+    ConversationMessage rows. Keep this serializer aligned with MessageRecord so
+    message creation/loading never attempts to access conversation-only columns.
+    """
     return {
         "id": row.id,
         "conversation_id": row.conversation_id,
         "role": row.role,
         "content": row.content,
         "metadata": row.metadata_json or {},
-        "memory_summary": row.memory_summary,
-        "memory_compacted_through_message_id": row.memory_compacted_through_message_id,
-        "memory_updated_at": row.memory_updated_at,
         "created_at": row.created_at,
     }
 

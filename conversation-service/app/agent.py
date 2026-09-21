@@ -454,6 +454,10 @@ class MovieAgent:
                         return answer, plan, tool_calls_count, tool_failures
                     continue
 
+                # Normalize safe LLM shorthand before both tracing and execution so
+                # the UI shows the exact canonical arguments sent to MCP.
+                arguments = self.mcp.normalize_tool_arguments(name, arguments)
+
                 tool_calls_count += 1
                 await emit("tool_started", {"tool": name, "arguments": arguments})
                 try:

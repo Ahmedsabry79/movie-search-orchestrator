@@ -105,28 +105,142 @@ class MCPGateway:
 
     @staticmethod
     def _normalize_tool_arguments(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        """Repair a small set of safe, unambiguous tool-call shape mistakes.
+        """Repair safe, unambiguous tool-call shape mistakes before MCP validation.
 
-        The semantic tool used to take a nested `request` object. The current MCP
-        schema is intentionally flat, but this compatibility shim prevents an older
-        cached model/tool pattern such as {"request": "Avatr"} from becoming a
-        failed MCP call. It does not guess ambiguous structured-search arguments.
+        The live MCP schemas are intentionally flat for the high-frequency search tools,
+        but this shim keeps older cached tool-call patterns working and normalizes a few
+        common LLM shortcuts (scalar relation values, scalar ranges, etc.).
         """
-        if name != "search_movies_semantic":
+        arguments = dict(arguments or {})
+
+        if name == "search_movies_semantic":
+            request = arguments.pop("request", None)
+            if isinstance(request, str) and request.strip():
+                arguments.setdefault("query", request.strip())
+            elif isinstance(request, dict):
+                arguments = {**request, **arguments}
             return arguments
-        request = arguments.get("request")
-        if isinstance(request, str) and request.strip():
-            repaired = {key: value for key, value in arguments.items() if key != "request"}
-            repaired.setdefault("query", request.strip())
-            return repaired
-        if isinstance(request, dict):
-            repaired = dict(request)
-            repaired.update({key: value for key, value in arguments.items() if key != "request"})
-            return repaired
+
+        if name != "search_movies_db":
+            return arguments
+
+        # v4.1 and earlier exposed search_movies_db(criteria={...}). Unwrap it.
+        criteria = arguments.pop("criteria", None)
+        if isinstance(criteria, str) and criteria.strip():
+            arguments.setdefault("titles", [criteria.strip()])
+        elif isinstance(criteria, dict):
+            arguments = {**criteria, **arguments}
+
+        # If the model emits only a generic query for this explicitly structured tool,
+        # interpreting it as a literal/fuzzy title query is the least surprising repair.
+        if set(arguments) == {"query"} and isinstance(arguments.get("query"), str):
+            query = arguments.pop("query").strip()
+            if query:
+                arguments["titles"] = [query]
+
+        list_fields = {
+            "movie_ids", "titles", "original_titles", "taglines"
+        }
+        relation_fields = {
+            "genres", "keywords", "production_companies",
+            "production_countries", "spoken_languages", "cast", "crew",
+            "cast_characters", "crew_departments", "crew_jobs",
+            "original_languages", "statuses",
+        }
+        range_fields = {
+            "budget", "popularity", "release_year", "revenue", "runtime",
+            "vote_average", "vote_count",
+        }
+
+        for field in list_fields:
+            value = arguments.get(field)
+            if value is not None and not isinstance(value, list):
+                arguments[field] = [value]
+
+        for field in relation_fields:
+            value = arguments.get(field)
+            if isinstance(value, str):
+                arguments[field] = {"values": [value], "match": "all"}
+            elif isinstance(value, list):
+                arguments[field] = {"values": value, "match": "all"}
+            elif isinstance(value, dict):
+                # Accept common aliases while preserving explicit canonical values.
+                if "values" not in value:
+                    candidate = value.get("value") or value.get("names") or value.get("items")
+                    if candidate is not None:
+                        value = dict(value)
+                        value["values"] = candidate if isinstance(candidate, list) else [candidate]
+                arguments[field] = value
+
+        for field in range_fields:
+            value = arguments.get(field)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                arguments[field] = {"eq": value}
+            elif isinstance(value, dict):
+                value = dict(value)
+                aliases = {
+                    "gte": "min", "ge": "min", "from": "min",
+                    "lte": "max", "le": "max", "to": "max",
+                    "equals": "eq", "value": "eq",
+                }
+                for source, target in aliases.items():
+                    if source in value and target not in value:
+                        value[target] = value.pop(source)
+                arguments[field] = value
+
+        release_date = arguments.get("release_date")
+        if isinstance(release_date, str):
+            arguments["release_date"] = {"eq": release_date}
+        elif isinstance(release_date, dict):
+            release_date = dict(release_date)
+            aliases = {
+                "from": "from_date", "min": "from_date", "gte": "from_date",
+                "to": "to_date", "max": "to_date", "lte": "to_date",
+                "equals": "eq", "value": "eq",
+            }
+            for source, target in aliases.items():
+                if source in release_date and target not in release_date:
+                    release_date[target] = release_date.pop(source)
+            arguments["release_date"] = release_date
+
+        sort = arguments.get("sort")
+        if sort not in (None, [], ""):
+            sort_items = sort if isinstance(sort, list) else [sort]
+            normalized_sort: list[dict[str, str]] = []
+            for item in sort_items:
+                if isinstance(item, dict):
+                    field = item.get("field")
+                    direction = str(item.get("direction") or "desc").lower()
+                    if field:
+                        normalized_sort.append({"field": str(field), "direction": direction})
+                    continue
+                if not isinstance(item, str) or not item.strip():
+                    continue
+                raw = item.strip()
+                direction = "desc"
+                if raw.startswith("-"):
+                    raw = raw[1:].strip()
+                    direction = "desc"
+                elif raw.startswith("+"):
+                    raw = raw[1:].strip()
+                    direction = "asc"
+                elif ":" in raw:
+                    raw, direction = (part.strip() for part in raw.split(":", 1))
+                else:
+                    parts = raw.rsplit(None, 1)
+                    if len(parts) == 2 and parts[1].lower() in {"asc", "desc"}:
+                        raw, direction = parts[0].strip(), parts[1].lower()
+                normalized_sort.append({"field": raw, "direction": direction.lower()})
+            arguments["sort"] = normalized_sort
+
         return arguments
 
+    def normalize_tool_arguments(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Public normalization hook used by the orchestrator before tracing/execution."""
+        return self._normalize_tool_arguments(name, arguments)
+
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> MCPToolResult:
-        arguments = self._normalize_tool_arguments(name, arguments)
+        arguments = self.normalize_tool_arguments(name, arguments)
         last_error: Exception | None = None
         attempts = max(1, self.settings.mcp_transport_retries)
         for attempt in range(1, attempts + 1):

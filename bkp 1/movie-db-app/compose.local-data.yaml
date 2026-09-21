@@ -1,5 +1,0 @@
-# Optional: read the original CSVs from ./data/raw instead of downloading them.
-services:
-  app:
-    volumes:
-      - ./data/raw:/app/data/raw:ro

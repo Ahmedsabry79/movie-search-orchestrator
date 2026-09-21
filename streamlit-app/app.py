@@ -6,6 +6,7 @@ import httpx
 import streamlit as st
 
 from client import ClientConfig, ConversationClient
+from run_manager import RunManager, RunSnapshot
 
 
 st.set_page_config(
@@ -18,15 +19,29 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-      .block-container { max-width: 1180px; padding-top: 2rem; padding-bottom: 4rem; }
-      [data-testid="stSidebar"] { border-right: 1px solid rgba(128,128,128,.18); }
-      .movie-agent-kicker { font-size: .82rem; opacity: .68; letter-spacing: .06em; text-transform: uppercase; }
-      .movie-agent-subtle { opacity: .68; font-size: .92rem; }
-      .movie-agent-chip {
-        display: inline-block; padding: .18rem .5rem; margin-right: .35rem; margin-bottom: .25rem;
-        border-radius: 999px; border: 1px solid rgba(128,128,128,.28); font-size: .78rem;
+      .block-container { max-width: 1180px; padding-top: 1.55rem; padding-bottom: 3.5rem; }
+      [data-testid="stSidebar"] { border-right: 1px solid rgba(128,128,128,.17); }
+      [data-testid="stSidebar"] .block-container { padding-top: 1.25rem; }
+      .movie-agent-kicker { font-size: .76rem; opacity: .62; letter-spacing: .09em; text-transform: uppercase; font-weight: 650; }
+      .movie-agent-subtle { opacity: .67; font-size: .92rem; max-width: 760px; }
+      .movie-agent-hero { margin-bottom: .8rem; }
+      .movie-agent-hero h1 { margin: .18rem 0 .15rem 0; font-size: 2.05rem; }
+      .movie-agent-pill {
+        display: inline-flex; align-items: center; gap: .35rem; padding: .24rem .55rem;
+        border-radius: 999px; border: 1px solid rgba(128,128,128,.24); font-size: .78rem;
+        margin: 0 .3rem .25rem 0;
       }
-      div[data-testid="stStatusWidget"] { border-radius: 14px; }
+      .movie-agent-live-dot {
+        width: .45rem; height: .45rem; border-radius: 50%; display: inline-block;
+        background: #22c55e; box-shadow: 0 0 0 .16rem rgba(34,197,94,.12);
+      }
+      .movie-agent-muted { opacity: .62; }
+      div[data-testid="stStatusWidget"] { border-radius: 13px; }
+      div[data-testid="stChatMessage"] { padding-top: .35rem; padding-bottom: .35rem; }
+      div[data-testid="stButton"] button { border-radius: 9px; font-weight: 600; }
+      .movie-agent-event-error {
+        border-left: 3px solid #ef4444; padding-left: .7rem; margin: .25rem 0 .45rem;
+      }
     </style>
     """,
     unsafe_allow_html=True,
@@ -44,6 +59,15 @@ def init_state() -> None:
     st.session_state.setdefault("load_conversation_id", "")
     st.session_state.setdefault("last_trace", [])
     st.session_state.setdefault("last_error", None)
+    st.session_state.setdefault("show_events", True)
+    st.session_state.setdefault("show_payloads", False)
+    st.session_state.setdefault("show_debug", False)
+    if "run_manager" not in st.session_state:
+        st.session_state.run_manager = RunManager()
+
+
+def manager() -> RunManager:
+    return st.session_state.run_manager
 
 
 def create_new_conversation(client: ConversationClient) -> None:
@@ -72,18 +96,57 @@ def load_snapshot(client: ConversationClient) -> dict[str, Any] | None:
         raise
 
 
-def render_message(message: dict[str, Any]) -> None:
+def _events_by_run(snapshot: dict[str, Any] | None) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    if not snapshot:
+        return grouped
+    for event in snapshot.get("events", []):
+        run_id = str(event.get("run_id") or "")
+        if not run_id:
+            continue
+        grouped.setdefault(run_id, []).append(event)
+    for events in grouped.values():
+        events.sort(key=lambda item: (int(item.get("sequence") or 0), str(item.get("created_at") or "")))
+    return grouped
+
+
+def render_persisted_message(
+    message: dict[str, Any],
+    *,
+    events_by_run: dict[str, list[dict[str, Any]]],
+    show_events: bool,
+    show_payloads: bool,
+) -> None:
     role = message.get("role")
     if role not in {"user", "assistant"}:
         return
+
     with st.chat_message(role):
+        if role == "assistant" and show_events:
+            metadata = message.get("metadata") or {}
+            run_id = str(metadata.get("run_id") or "")
+            persisted_events = events_by_run.get(run_id, []) if run_id else []
+            if persisted_events:
+                with st.container(border=True):
+                    st.caption(f"Agent activity · {len(persisted_events)} persisted event(s)")
+                    for event in persisted_events:
+                        render_trace_event(
+                            str(event.get("event_type") or "event"),
+                            event.get("payload") or {},
+                            show_payloads=show_payloads,
+                        )
+                st.write("")
         st.markdown(message.get("content") or "")
 
 
 def compact_tool_result(payload: dict[str, Any]) -> str:
     tool = payload.get("tool", "tool")
     if payload.get("is_error"):
-        return f"{tool} failed"
+        error = str(payload.get("error") or "Tool execution failed.")
+        error = " ".join(error.split())
+        if len(error) > 360:
+            error = error[:357] + "…"
+        return f"{tool} failed — {error}"
     for key in ("returned_count", "count", "matched_movie_count", "total_groups"):
         if payload.get(key) is not None:
             return f"{tool} · {payload[key]} {key.replace('_', ' ')}"
@@ -102,138 +165,189 @@ def quality_label(payload: dict[str, Any]) -> str:
     return f"{source.title()} evidence: **{quality}**{suffix}"
 
 
-def render_agent_event(status, event_type: str, payload: dict[str, Any], *, show_payloads: bool) -> str | None:
+def _status_label(run: RunSnapshot) -> tuple[str, str]:
+    if run.error:
+        return "Agent run failed", "error"
+    if run.done:
+        return f"Completed · {run.elapsed_seconds:.1f}s", "complete"
+    if run.answer:
+        return "Writing the answer…", "running"
+    if run.events:
+        event_type = run.events[-1].get("event")
+        payload = run.events[-1].get("data") or {}
+        if event_type == "tool_started":
+            return f"Calling {payload.get('tool', 'tool')}…", "running"
+        if event_type == "thinking":
+            return str(payload.get("message") or "Working…"), "running"
+        if event_type == "plan":
+            return f"Plan · {str(payload.get('strategy') or 'ready').replace('_', ' ')}", "running"
+    return "Starting agent run…", "running"
+
+
+def render_trace_event(event_type: str, payload: dict[str, Any], *, show_payloads: bool) -> None:
     if event_type == "run_started":
-        status.update(label="Understanding your request…", state="running")
-        return None
-
+        st.caption("Run started")
+        return
     if event_type == "thinking":
-        message = str(payload.get("message") or "Working on the request…")
-        status.update(label=message, state="running")
-        status.markdown(f"💭 {message}")
-        return None
-
+        st.markdown(f"💭 {payload.get('message') or 'Working on the request…'}")
+        return
     if event_type == "memory_compaction_started":
-        status.markdown("🧠 **Memory:** compacting older conversation context…")
-        return None
-
+        st.markdown("🧠 **Memory:** compacting older conversation context…")
+        return
     if event_type == "memory_compaction_completed":
-        status.markdown(
+        st.markdown(
             "🧠 **Memory updated:** "
             f"{payload.get('facts', 0)} facts · {payload.get('constraints', 0)} constraints · "
             f"{payload.get('entities', 0)} entities"
         )
-        return None
-
+        return
     if event_type == "memory_compaction_skipped":
-        status.warning(str(payload.get("message") or "Memory refresh skipped."))
-        return None
-
+        st.warning(str(payload.get("message") or "Memory refresh skipped."))
+        return
     if event_type == "context_recovery":
-        status.warning(str(payload.get("message") or "Restarting with a smaller context…"))
-        status.update(label="Retrying with focused context…", state="running", expanded=True)
-        return None
-
+        st.warning(str(payload.get("message") or "Restarting with a smaller context…"))
+        return
     if event_type == "plan":
         strategy = str(payload.get("strategy") or "unknown").replace("_", " ")
-        summary = payload.get("summary") or "Plan created"
-        status.update(label=f"Plan · {strategy}", state="running")
-        status.markdown(f"🧭 **Plan:** {summary}")
+        st.markdown(f"🧭 **Plan · {strategy}:** {payload.get('summary') or 'Plan created'}")
         criteria = payload.get("extracted_criteria") or []
         if criteria:
-            status.markdown("**Extracted criteria**")
-            for item in criteria:
-                status.markdown(f"- {item}")
-        return None
-
+            st.markdown("**Extracted criteria:** " + " · ".join(str(item) for item in criteria[:8]))
+        return
     if event_type == "tool_started":
-        tool = payload.get("tool", "tool")
-        status.update(label=f"Calling {tool}…", state="running")
-        status.markdown(f"🔧 **Calling** `{tool}`")
+        st.markdown(f"🔧 **Calling** `{payload.get('tool', 'tool')}`")
         if show_payloads and payload.get("arguments") is not None:
-            status.json(payload["arguments"])
-        return None
-
+            st.json(payload["arguments"])
+        return
     if event_type == "tool_result":
-        icon = "❌" if payload.get("is_error") else "✅"
-        status.markdown(f"{icon} **Tool result:** {compact_tool_result(payload)}")
+        if payload.get("is_error"):
+            st.error(f"Tool result: {compact_tool_result(payload)}")
+        else:
+            st.markdown(f"✅ **Tool result:** {compact_tool_result(payload)}")
         if show_payloads:
-            status.json(payload)
-        return None
-
+            st.json(payload)
+        return
     if event_type == "retrieval_quality":
         quality = str(payload.get("quality") or "unknown")
         icon = {"strong": "🟢", "acceptable": "🟡", "weak": "🟠", "no_match": "🔴"}.get(quality, "⚪")
-        status.markdown(f"{icon} {quality_label(payload)}")
+        st.markdown(f"{icon} {quality_label(payload)}")
         if show_payloads:
-            status.json(payload)
-        return None
-
+            st.json(payload)
+        return
     if event_type == "fallback_available":
-        status.markdown(
-            "↪️ **Fallback available:** structured evidence was not convincing enough; semantic retrieval may be used."
-        )
-        return None
-
+        st.markdown("↪️ **Fallback:** structured evidence is weak/no-match; semantic retrieval is now available.")
+        return
     if event_type == "tool_error":
-        status.error(
-            f"Tool failure: `{payload.get('tool', 'unknown')}` — {payload.get('message', 'unknown error')}"
-        )
+        st.error(f"Tool failure: `{payload.get('tool', 'unknown')}` — {payload.get('message', 'unknown error')}")
         if show_payloads:
-            status.json(payload)
-        return None
-
+            st.json(payload)
+        return
     if event_type == "response_started":
-        status.update(label="Writing the answer…", state="running")
-        return None
-
-    if event_type == "assistant_message":
-        return str(payload.get("content") or "")
-
+        st.markdown("✍️ **Writing the answer…**")
+        return
     if event_type == "completed":
-        calls = payload.get("tool_calls", 0)
-        failures = payload.get("tool_failures", 0)
-        status.update(
-            label=f"Completed · {calls} tool call(s) · {failures} failure(s)",
-            state="complete",
-            expanded=False,
+        st.caption(
+            f"Completed · {payload.get('tool_calls', 0)} tool call(s) · "
+            f"{payload.get('tool_failures', 0)} failure(s)"
         )
-        return None
-
-    if event_type == "error":
-        status.error(payload.get("message", "Agent execution failed."))
-        status.update(label="Agent run failed", state="error", expanded=True)
-        return None
-
+        return
+    if event_type in {"error", "client_stream_error"}:
+        st.error(payload.get("message", "Agent execution failed."))
+        return
+    if event_type == "assistant_message":
+        return
     if show_payloads:
-        status.markdown(f"**{event_type}**")
-        status.json(payload)
+        st.markdown(f"**{event_type}**")
+        st.json(payload)
+
+
+def _latest_user_content(messages: list[dict[str, Any]]) -> str | None:
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            return str(message.get("content") or "")
     return None
 
 
-def sidebar(client: ConversationClient, snapshot: dict[str, Any] | None) -> tuple[bool, bool, bool]:
+@st.fragment(run_every=0.35)
+def live_run_fragment(
+    conversation_id: str,
+    persisted_messages: list[dict[str, Any]],
+    show_events: bool,
+    show_payloads: bool,
+) -> None:
+    run = manager().get(conversation_id)
+    if run is None:
+        return
+
+    # The background worker may persist the user message just after the full app
+    # rerun. Render it optimistically only when it is not already in the snapshot.
+    if _latest_user_content(persisted_messages) != run.prompt:
+        with st.chat_message("user"):
+            st.markdown(run.prompt)
+
+    with st.chat_message("assistant"):
+        label, state = _status_label(run)
+        if show_events:
+            with st.container(border=True):
+                icon = "✅" if state == "complete" else ("❌" if state == "error" else "⏳")
+                st.markdown(f"{icon} **Agent activity** · {label}")
+                for event in run.events[-80:]:
+                    render_trace_event(
+                        str(event.get("event") or "event"),
+                        event.get("data") or {},
+                        show_payloads=show_payloads,
+                    )
+            st.write("")
+        elif not run.done:
+            st.caption(label)
+
+        if run.answer:
+            st.markdown(run.answer if run.done else run.answer + "▌")
+        elif run.error:
+            st.error(run.error)
+        else:
+            st.caption("Waiting for the first response token…")
+
+    if run.done and not run.refresh_requested:
+        st.session_state.last_trace = run.events
+        manager().mark_refresh_requested(conversation_id)
+        # completed is emitted only after the assistant message has been persisted,
+        # so a full rerun can safely replace the transient live panel with DB history.
+        st.rerun(scope="app")
+
+
+def sidebar(client: ConversationClient, snapshot: dict[str, Any] | None) -> tuple[bool, bool, bool, bool]:
+    run_manager = manager()
+    run_manager.prune()
+
     with st.sidebar:
         st.markdown('<div class="movie-agent-kicker">Integration Console</div>', unsafe_allow_html=True)
         st.title("🎬 Movie Agent")
 
         ready, health = client.health()
         if ready:
-            st.success("All agent-facing services ready")
+            st.markdown('<span class="movie-agent-pill"><span class="movie-agent-live-dot"></span> Agent ready</span>', unsafe_allow_html=True)
         else:
             st.error("Conversation service unavailable")
             with st.expander("Health details"):
                 st.json(health)
 
-        if st.button("＋ New conversation", use_container_width=True, disabled=not ready):
+        st.write("")
+        if st.button("＋ New conversation", use_container_width=True, disabled=not ready, type="primary"):
             try:
                 create_new_conversation(client)
                 st.rerun()
             except Exception as exc:
                 st.error(f"Could not create conversation: {exc}")
 
-        with st.expander("Load persisted conversation", expanded=False):
-            st.text_input("Conversation UUID", key="load_conversation_id", label_visibility="collapsed")
-            if st.button("Load conversation", use_container_width=True, disabled=not ready):
+        with st.expander("Open conversation", expanded=False):
+            st.text_input(
+                "Conversation UUID",
+                key="load_conversation_id",
+                placeholder="Paste a persisted conversation UUID",
+                label_visibility="collapsed",
+            )
+            if st.button("Load", use_container_width=True, disabled=not ready, key="load_conversation_btn"):
                 candidate = st.session_state.load_conversation_id.strip()
                 if candidate:
                     try:
@@ -246,13 +360,49 @@ def sidebar(client: ConversationClient, snapshot: dict[str, Any] | None) -> tupl
                     except Exception as exc:
                         st.error(f"Could not load conversation: {exc}")
 
+        active_runs = run_manager.active()
+        if active_runs:
+            st.divider()
+            st.caption("Background generations")
+            for active in active_runs:
+                selected = active.conversation_id == st.session_state.conversation_id
+                st.markdown(
+                    f"**{'Current' if selected else 'Running'}** · {active.elapsed_seconds:.1f}s  \n"
+                    f"{active.prompt[:72]}{'…' if len(active.prompt) > 72 else ''}"
+                )
+                if not selected and st.button(
+                    "Open live conversation",
+                    key=f"open_active_{active.run_id}",
+                    use_container_width=True,
+                ):
+                    st.session_state.conversation_id = active.conversation_id
+                    st.session_state.last_error = None
+                    st.rerun()
+
         if st.session_state.conversation_id:
-            st.caption("Conversation")
+            st.divider()
+            st.caption("Current conversation")
             st.code(st.session_state.conversation_id, language=None)
+            current_run = run_manager.get(st.session_state.conversation_id)
+            if current_run and not current_run.done:
+                st.info("Generation continues in the background. You can use sidebar controls without interrupting it.")
 
         st.divider()
-        show_payloads = st.toggle("Show tool payloads", value=False)
-        show_debug = st.toggle("Show debug trace", value=False)
+        st.toggle(
+            "Show agent activity",
+            key="show_events",
+            help="Keep planning, tool calls, retrieval quality and recovery events visible during and after generation.",
+        )
+        st.toggle(
+            "Show tool payloads",
+            key="show_payloads",
+            help="Show full tool arguments/results inside the activity trace.",
+        )
+        st.toggle(
+            "Show debug trace",
+            key="show_debug",
+            help="Show the raw recent SSE event list in the sidebar for debugging.",
+        )
 
         if snapshot:
             messages = snapshot.get("messages", [])
@@ -271,18 +421,24 @@ def sidebar(client: ConversationClient, snapshot: dict[str, Any] | None) -> tupl
 
             if runs:
                 latest = runs[0]
-                st.caption(f"Latest run · {latest.get('status', 'unknown')}")
+                st.caption(f"Latest persisted run · {latest.get('status', 'unknown')}")
 
-        if show_debug and st.session_state.last_trace:
+        if st.session_state.show_debug and st.session_state.last_trace:
             with st.expander("Last SSE trace", expanded=False):
                 st.json(st.session_state.last_trace)
 
-    return ready, show_payloads, show_debug
+    return (
+        ready,
+        st.session_state.show_events,
+        st.session_state.show_payloads,
+        st.session_state.show_debug,
+    )
 
 
 def main() -> None:
     init_state()
     client = get_client()
+    manager().prune()
 
     ready, _ = client.health()
     if ready and not st.session_state.conversation_id:
@@ -297,85 +453,88 @@ def main() -> None:
         snapshot = None
         st.session_state.last_error = str(exc)
 
-    ready, show_payloads, _ = sidebar(client, snapshot)
+    # If a completed background run is now present in persisted history, retire its
+    # transient UI object. The conversation remains fully available from PostgreSQL.
+    current_id = st.session_state.conversation_id
+    current_run = manager().get(current_id)
+    if current_run and current_run.done and snapshot:
+        assistant_messages = [
+            str(item.get("content") or "")
+            for item in snapshot.get("messages", [])
+            if item.get("role") == "assistant"
+        ]
+        if current_run.answer and current_run.answer in assistant_messages:
+            manager().clear_completed(current_id)
+            current_run = None
 
-    st.markdown('<div class="movie-agent-kicker">Agentic Movie Retrieval</div>', unsafe_allow_html=True)
-    st.title("Movie Agent")
+    ready, show_events, show_payloads, _ = sidebar(client, snapshot)
+
     st.markdown(
-        '<div class="movie-agent-subtle">Structured/fuzzy catalog search, analytics, semantic retrieval and persisted conversation memory.</div>',
+        """
+        <div class="movie-agent-hero">
+          <div class="movie-agent-kicker">Agentic Movie Retrieval</div>
+          <h1>Movie Agent</h1>
+          <div class="movie-agent-subtle">
+            Structured and fuzzy catalog search, controlled analytics, semantic retrieval,
+            persisted memory, and live tool execution.
+          </div>
+        </div>
+        """,
         unsafe_allow_html=True,
     )
-    st.write("")
 
     if st.session_state.last_error:
         st.error(st.session_state.last_error)
 
-    if snapshot:
-        for message in snapshot.get("messages", []):
-            render_message(message)
-    elif ready:
+    persisted_messages = snapshot.get("messages", []) if snapshot else []
+    persisted_events_by_run = _events_by_run(snapshot)
+    for message in persisted_messages:
+        render_persisted_message(
+            message,
+            events_by_run=persisted_events_by_run,
+            show_events=show_events,
+            show_payloads=show_payloads,
+        )
+
+    current_run = manager().get(st.session_state.conversation_id)
+    if current_run:
+        live_run_fragment(
+            st.session_state.conversation_id,
+            persisted_messages,
+            show_events,
+            show_payloads,
+        )
+
+    if not snapshot and ready:
         st.info("Create or load a conversation to begin.")
 
+    busy = bool(current_run and not current_run.done)
     prompt = st.chat_input(
         "Ask about a movie, describe a plot, combine filters, or query the catalog…",
-        disabled=not ready or not bool(st.session_state.conversation_id),
+        disabled=(
+            not ready
+            or not bool(st.session_state.conversation_id)
+            or busy
+        ),
     )
-    if not prompt:
-        if snapshot and not snapshot.get("messages"):
-            st.caption(
-                "Try: “How many movies are there in each genre?” · “Find the movie about entering dreams” · "
-                "“Nolan movies after 2010 rated above 8”"
-            )
-        return
 
-    with st.chat_message("user"):
-        st.markdown(prompt)
+    if busy:
+        st.caption("This conversation is generating. Sidebar controls remain available; open a new conversation to ask another question in parallel.")
 
-    answer = ""
-    trace: list[dict[str, Any]] = []
-    streamed_chars = 0
-
-    with st.chat_message("assistant"):
-        status = st.status("Starting agent run…", expanded=True)
-        answer_placeholder = st.empty()
+    if prompt:
         try:
-            for event_type, payload in client.stream_message(st.session_state.conversation_id, prompt):
-                if event_type != "assistant_delta":
-                    trace.append({"event": event_type, "data": payload})
-
-                if event_type == "assistant_delta":
-                    delta = str(payload.get("delta") or "")
-                    if delta:
-                        answer += delta
-                        streamed_chars += len(delta)
-                        answer_placeholder.markdown(answer + "▌")
-                    continue
-
-                candidate_answer = render_agent_event(
-                    status,
-                    event_type,
-                    payload,
-                    show_payloads=show_payloads,
-                )
-                if candidate_answer is not None:
-                    answer = candidate_answer
-                    answer_placeholder.markdown(answer)
-        except httpx.HTTPStatusError as exc:
-            detail = exc.response.text[:1000]
-            status.error(f"Conversation API returned HTTP {exc.response.status_code}: {detail}")
-            status.update(label="Request failed", state="error", expanded=True)
+            manager().start(client, st.session_state.conversation_id, prompt)
+            st.session_state.last_error = None
+            st.rerun()
         except Exception as exc:
-            status.error(str(exc))
-            status.update(label="Request failed", state="error", expanded=True)
+            st.session_state.last_error = str(exc)
+            st.rerun()
 
-        if answer:
-            answer_placeholder.markdown(answer)
-        else:
-            answer_placeholder.warning("No assistant answer was returned. Inspect the execution trace for details.")
-
-    if streamed_chars:
-        trace.append({"event": "stream_summary", "data": {"streamed_chars": streamed_chars}})
-    st.session_state.last_trace = trace
+    if snapshot and not persisted_messages and not current_run:
+        st.caption(
+            "Try: “How many movies are there in each genre?” · “Find the movie about entering dreams” · "
+            "“Nolan movies after 2010 rated above 8”"
+        )
 
 
 if __name__ == "__main__":

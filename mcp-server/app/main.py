@@ -17,9 +17,14 @@ from .schemas import (
     DatabaseAnalyticsResponse,
     DatabaseSearchCriteria,
     DatabaseSearchResponse,
+    DateRange,
+    IntegerRange,
     MovieFilterCriteria,
+    NumericRange,
     ReferenceResolutionResponse,
     ReferenceType,
+    SearchSort,
+    StringSetFilter,
     SemanticSearchRequest,
     SemanticSearchResponse,
 )
@@ -71,6 +76,52 @@ def _timeout() -> httpx.Timeout:
     return httpx.Timeout(seconds, connect=5.0)
 
 
+def _normalize_search_sort(value) -> list[SearchSort]:
+    """Accept canonical sort objects plus compact LLM-friendly shorthand.
+
+    Supported examples:
+    - {"field": "vote_average", "direction": "desc"}
+    - "-vote_average"  -> descending
+    - "+release_year"  -> ascending
+    - "vote_average:desc"
+    - ["-vote_average", "-vote_count"]
+    """
+    if value in (None, [], ""):
+        return []
+    items = value if isinstance(value, list) else [value]
+    normalized: list[SearchSort] = []
+    for item in items:
+        if isinstance(item, SearchSort):
+            normalized.append(item)
+            continue
+        if isinstance(item, dict):
+            normalized.append(SearchSort.model_validate(item))
+            continue
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(f"Unsupported sort value: {item!r}")
+
+        raw = item.strip()
+        direction = "desc"
+        if raw.startswith("-"):
+            raw = raw[1:].strip()
+            direction = "desc"
+        elif raw.startswith("+"):
+            raw = raw[1:].strip()
+            direction = "asc"
+        elif ":" in raw:
+            raw, direction = (part.strip() for part in raw.split(":", 1))
+        else:
+            parts = raw.rsplit(None, 1)
+            if len(parts) == 2 and parts[1].lower() in {"asc", "desc"}:
+                raw, direction = parts[0].strip(), parts[1].lower()
+
+        direction = direction.lower()
+        if direction not in {"asc", "desc"}:
+            raise ValueError(f"Sort direction must be asc/desc, got {direction!r}")
+        normalized.append(SearchSort(field=raw, direction=direction))
+    return normalized
+
+
 async def _request_json(
     method: str,
     url: str,
@@ -108,19 +159,88 @@ async def get_database_schema() -> dict:
 
 
 @mcp.tool()
-async def search_movies_db(criteria: DatabaseSearchCriteria) -> DatabaseSearchResponse:
+async def search_movies_db(
+    movie_ids: list[int] | None = None,
+    titles: list[str] | None = None,
+    original_titles: list[str] | None = None,
+    taglines: list[str] | None = None,
+    genres: StringSetFilter | None = None,
+    keywords: StringSetFilter | None = None,
+    production_companies: StringSetFilter | None = None,
+    production_countries: StringSetFilter | None = None,
+    spoken_languages: StringSetFilter | None = None,
+    cast: StringSetFilter | None = None,
+    crew: StringSetFilter | None = None,
+    cast_characters: StringSetFilter | None = None,
+    crew_departments: StringSetFilter | None = None,
+    crew_jobs: StringSetFilter | None = None,
+    budget: IntegerRange | None = None,
+    original_languages: StringSetFilter | None = None,
+    popularity: NumericRange | None = None,
+    release_date: DateRange | None = None,
+    release_year: IntegerRange | None = None,
+    revenue: IntegerRange | None = None,
+    runtime: NumericRange | None = None,
+    statuses: StringSetFilter | None = None,
+    vote_average: NumericRange | None = None,
+    vote_count: IntegerRange | None = None,
+    homepage_contains: str | None = None,
+    fuzzy_threshold: float | None = None,
+    sort: str | SearchSort | list[str | SearchSort] | None = None,
+    limit: int = 20,
+) -> DatabaseSearchResponse:
     """Search movie-db-app using one or many structured/fuzzy criteria.
 
-    The DB app owns all PostgreSQL querying. This tool never issues SQL directly.
-    Criteria across fields are combined, while relation value sets honor `match=all`
-    or `match=any`. Fuzzy matching is automatic for title, original title, literal tagline,
-    named relations, cast/crew person names, and cast.character. Every returned hit includes
-    `fuzzy_matches` evidence for fuzzy criteria.
+    Arguments are FLAT: pass movie criteria directly at the top level; do not wrap
+    them inside a `criteria` object. Examples:
+    - title typo: {"titles": ["Interstelar"]}
+    - actor + year + rating: {"cast": {"values": ["Tom Hanks"]},
+      "release_year": {"min": 2000}, "vote_average": {"min": 7.0}}
+    - character fuzzy match: {"cast_characters": {"values": ["Coopr"]}}
 
-    Overview/plot text is deliberately excluded from this tool. Use semantic search for
-    meaning such as "movie about a stranded astronaut" or paraphrased overview/tagline clues.
+    Criteria across fields are combined. Relation filters support `match=all|any`.
+    Fuzzy matching is automatic for title, original title, literal tagline, named
+    relations, cast/crew person names and cast.character. `sort` accepts canonical
+    objects such as {"field":"vote_average","direction":"desc"} and safe
+    shorthand such as "-vote_average". Returned hits include
+    per-field `fuzzy_matches` similarity evidence.
+
+    Overview/plot meaning is intentionally excluded; use search_movies_semantic.
     """
-    criteria.limit = min(criteria.limit, settings.max_search_limit)
+    try:
+        criteria = DatabaseSearchCriteria(
+            movie_ids=movie_ids or [],
+            titles=titles or [],
+            original_titles=original_titles or [],
+            taglines=taglines or [],
+            genres=genres,
+            keywords=keywords,
+            production_companies=production_companies,
+            production_countries=production_countries,
+            spoken_languages=spoken_languages,
+            cast=cast,
+            crew=crew,
+            cast_characters=cast_characters,
+            crew_departments=crew_departments,
+            crew_jobs=crew_jobs,
+            budget=budget,
+            original_languages=original_languages,
+            popularity=popularity,
+            release_date=release_date,
+            release_year=release_year,
+            revenue=revenue,
+            runtime=runtime,
+            statuses=statuses,
+            vote_average=vote_average,
+            vote_count=vote_count,
+            homepage_contains=homepage_contains,
+            fuzzy_threshold=fuzzy_threshold,
+            sort=_normalize_search_sort(sort),
+            limit=min(limit, settings.max_search_limit),
+        )
+    except ValueError as exc:
+        raise ToolError(f"Invalid structured movie search arguments: {exc}") from exc
+
     payload = criteria.model_dump(mode="json", exclude_none=True, exclude_defaults=True)
     data = await _request_json(
         "POST",
