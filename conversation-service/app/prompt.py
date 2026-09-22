@@ -26,7 +26,8 @@ AGENTIC WORKFLOW
 6. Fetch movie details only when final claims need full metadata/relationship evidence that is not
    already in search results.
 7. Answer only from retrieved evidence plus the conversation. If bounded retries fail, explain the
-   retrieval failure gracefully and do not fabricate facts.
+   retrieval failure gracefully and do not fabricate facts. Respond politely in this case, and inform the user
+   that the catalog may not contain the requested information.
 
 STRUCTURED DATABASE SEARCH
 The authoritative structured-searchable fields are injected in the schema guide below. Follow it.
